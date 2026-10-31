@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { loadAgentSdk } from '@tencildev/provider-claude-code';
 import { codexProblem } from '@tencildev/provider-codex';
 import { EnsembleClient, EnsembleCredentialStore } from '@tencildev/provider-ensemble';
+import { activeOmpSessions } from '@tencildev/provider-omp/session-link';
 import {
     CredentialStore,
     createLocalPairingCode,
@@ -9,7 +10,7 @@ import {
     exchangePairingCredential,
 } from '@tencildev/provider-t3code';
 import pc from 'picocolors';
-import { findOmp, type ProviderName } from '../daemon/agents.ts';
+import type { ProviderName } from '../daemon/agents.ts';
 import { defaultDataDir } from '../daemon/thread-store.ts';
 
 /** Get the agent ready now, so the first page load is ready to go. */
@@ -78,14 +79,12 @@ async function checkCodex(log: (message: string) => void): Promise<void> {
             : `  ${pc.green('✓')} Codex is ready. Pins run in your Codex login.`,
     );
 }
-
-/** OMP needs no pairing: the daemon runs `omp acp` with its own settings and login. */
 async function checkOmp(log: (message: string) => void): Promise<void> {
-    const command = await findOmp();
+    const sessions = await activeOmpSessions();
     log(
-        command
-            ? `  ${pc.green('✓')} OMP is ready at ${command}. Pins run in your OMP settings and login.`
-            : `  ${pc.yellow('!')} OMP isn't installed. Install it, or set OMP_COMMAND to its path.`,
+        sessions.some(session => session.projectRoots.length > 0)
+            ? `  ${pc.green('✓')} Page comments are connected to a running OMP chat.`
+            : `  ${pc.yellow('!')} Connect this project with point_and_comment in the OMP chat you want to use. No separate agent will be started.`,
     );
 }
 

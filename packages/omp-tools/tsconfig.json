@@ -1,0 +1,7 @@
+{
+    "extends": "@tencildev/tsconfig/node.json",
+    "compilerOptions": {
+        "types": ["bun"]
+    },
+    "include": ["src"]
+}

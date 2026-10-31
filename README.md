@@ -61,10 +61,10 @@ so every provider receives identical input: text and images.
   port identifies its Ensemble thread (including forwarded ports); each pin creates
   a chat on that thread's checkout. A page served from an Ensemble project's own folder
   starts a new thread per pin, archived when the pin is resolved or deleted. A shared feed streams chat messages and tool steps.
-- **OMP** (`@tencildev/provider-omp`): runs `omp acp` (the Agent Client Protocol
-  over stdio) in the project's folder with the user's own OMP settings and login.
-  Threads are OMP sessions, replayed from what OMP saved. Tools that would need
-  approval are never approved by Tencil.
+- **OMP** (`@tencildev/provider-omp`): connects to the open conversation selected
+  by `point_and_comment` in the local OMP extension. Page comments share that
+  conversation's model, context, and permissions, with scoped saved history per
+  pin. No separate agent starts and Tencil approves no tool requests.
 
 A new provider is a workspace package that implements `Provider`, with tests against
 a fake of the agent in `packages/testing`. The daemon picks the provider per project in
@@ -81,7 +81,8 @@ a fake of the agent in `packages/testing`. The daemon picks the provider per pro
 | `packages/provider-claude-code` | Claude Code provider (Claude Agent SDK) |
 | `packages/provider-codex` | Codex provider (`codex app-server`) |
 | `packages/provider-ensemble` | Ensemble provider (public local API and SSE feed) |
-| `packages/provider-omp` | OMP provider (`omp acp`, Agent Client Protocol) |
+| `packages/provider-omp` | Same-conversation OMP provider over a private local socket |
+| `packages/omp-tools` | Local OMP tools: Safari-backed search, native Mac controls, and page comments |
 | `packages/testing` | Fake T3 Code, Ensemble and Codex servers and fake Agent SDK used by the tests |
 | `packages/tsconfig` | Shared TypeScript configs |
 | `apps/playground` | Vite + React app with the plugin, also the e2e test target |

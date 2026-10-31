@@ -1,10 +1,10 @@
-import { constants } from 'node:fs';
 import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import type { ProviderOption } from '@tencildev/protocol';
 import { findCodex } from '@tencildev/provider-codex';
 import { EnsembleClient } from '@tencildev/provider-ensemble';
+import { activeOmpSessions } from '@tencildev/provider-omp/session-link';
 import { CredentialStore, DEFAULT_T3_URL } from '@tencildev/provider-t3code';
 import { z } from 'zod';
 import { defaultDataDir } from './thread-store.ts';
@@ -49,10 +49,7 @@ export async function saveProvider(provider: ProviderName, dataDir = defaultData
     await rename(`${path}.tmp`, path);
 }
 
-/**
- * Which agents this machine has: a paired or running T3 Code, an installed
- * Claude Code, Codex's CLI or desktop app, a running Ensemble app, an installed OMP.
- */
+/** Which agents have an available local connection. */
 export async function detectAgents(
     options: { t3Url?: string } = {},
 ): Promise<Record<ProviderName, boolean>> {
@@ -60,15 +57,11 @@ export async function detectAgents(
         hasT3Code(options.t3Url),
         hasClaudeCode(),
         hasEnsemble(),
-        findOmp(),
+        activeOmpSessions().then(sessions =>
+            sessions.some(session => session.projectRoots.length > 0),
+        ),
     ]);
-    return {
-        t3code,
-        'claude-code': claudeCode,
-        codex: findCodex() !== undefined,
-        ensemble,
-        omp: omp !== undefined,
-    };
+    return { t3code, 'claude-code': claudeCode, codex: findCodex() !== undefined, ensemble, omp };
 }
 
 /**
@@ -126,29 +119,4 @@ async function hasClaudeCode(): Promise<boolean> {
         ),
     );
     return found.includes(true);
-}
-
-/**
- * The `omp` executable to run: `OMP_COMMAND` as given, else `omp` on the PATH,
- * else Bun's global bin (login services get a bare PATH).
- */
-export async function findOmp(): Promise<string | undefined> {
-    const override = process.env.OMP_COMMAND;
-    if (override) return override;
-    const name = process.platform === 'win32' ? 'omp.exe' : 'omp';
-    const candidates = [
-        ...(process.env.PATH ?? '')
-            .split(delimiter)
-            .filter(Boolean)
-            .map(dir => join(dir, name)),
-        join(homedir(), '.bun', 'bin', name),
-    ];
-    for (const path of candidates) {
-        const found = await access(path, constants.X_OK).then(
-            () => true,
-            () => false,
-        );
-        if (found) return path;
-    }
-    return undefined;
 }

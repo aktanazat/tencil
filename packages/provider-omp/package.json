@@ -4,14 +4,15 @@
     "private": true,
     "type": "module",
     "exports": {
-        ".": "./src/index.ts"
+        ".": "./src/index.ts",
+        "./session-link": "./src/session-link.ts"
     },
     "scripts": {
         "typecheck": "tsc -p ."
     },
     "dependencies": {
-        "@agentclientprotocol/sdk": "^2.2.0",
-        "@tencildev/protocol": "workspace:*"
+        "@tencildev/protocol": "workspace:*",
+        "zod": "^4.6.6"
     },
     "devDependencies": {
         "@tencildev/tsconfig": "workspace:*"

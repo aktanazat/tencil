@@ -72,7 +72,6 @@
         "prepack": "turbo run build --filter=tencil"
     },
     "dependencies": {
-        "@agentclientprotocol/sdk": "^2.2.0",
         "magic-string": "^1.4.3",
         "oxc-parser": "^0.153.0",
         "picocolors": "^1.1.1",

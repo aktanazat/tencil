@@ -173,23 +173,29 @@ is running when the daemon stops is lost; the pin turns red and you can follow u
 OMP support in this checkout is local-only, not published on npm. On this Mac, use
 the installed `~/.local/bin/tencil-omp` launcher rather than upstream `npx tencil`.
 
-With `--provider omp` (or OMP picked in a project's settings), the daemon runs
-`omp acp` in the project's folder, with your own OMP settings and login. There is
-nothing to pair or install. Tencil runs `omp` from the PATH, else `~/.bun/bin/omp`;
-set `OMP_COMMAND` to another executable. `--model` takes an omp model selector,
-e.g. `anthropic/claude-opus-5-5`; without it OMP uses its configured model.
+With `--provider omp` (or OMP picked in a project's settings), the daemon connects
+to an already open OMP conversation through the local `@tencildev/omp-tools`
+extension. In that conversation, call `point_and_comment` with `action: "connect"`
+and the absolute project root Tencil resolves. A monorepo's root can differ from
+the nested app folder. The extension is installed on this Mac under
+`~/.omp/agent/extensions/local-harnesses`; new OMP sessions discover it normally.
+It can also be loaded explicitly with `--extension packages/omp-tools/src/index.ts`.
 
 To run Tencil only while you use it, skip `setup` (it offers a login service):
 `~/.local/bin/tencil-omp init` adds the overlay and starts the daemon in the
 background, and `~/.local/bin/tencil-omp stop` ends it.
 
-Each pin is an OMP session, replayed from what OMP saved, so it survives a daemon
-restart. A session another omp is already writing to (in a terminal, say) is refused
-rather than opened twice. This ownership check currently supports macOS only;
-opening existing sessions on other systems is refused. Nobody is at a terminal
-to approve tool calls: tools follow your OMP configuration, Tencil approves nothing
-on its own, and `--runtime-mode` doesn't apply. OMP's projects don't show in the
-overlay's project picker.
+Page comments and images enter that same conversation, using its current model,
+context, and tool permissions. No child agent or separate OMP login starts.
+Each pin keeps a scoped reply history in OMP's saved conversation, without
+exposing unrelated main-chat messages to the page. Reopening the page or bridge
+replays that history; resuming the same OMP conversation reconnects it.
+
+Stop cancels only that pin's pending or active work. Unfinished work after an OMP
+restart is reported rather than silently rerun. A disconnected project cannot
+switch to a different conversation. Keep OMP open; Tencil approves no tool calls,
+and `--model` and `--runtime-mode` do not apply to this connection. Disconnect
+with `point_and_comment` and `action: "disconnect"` in OMP.
 
 ## Using it
 

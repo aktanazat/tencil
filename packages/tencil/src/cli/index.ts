@@ -38,11 +38,12 @@ ${pc.dim('Usage')}
 
 ${pc.dim('Daemon options')}
   --port <n>              Port (default ${DEFAULT_PORT}, env TENCIL_PORT)
-  --provider <name>       t3code | claude-code | codex | ensemble: this machine's agent (setup asks when unset)
+  --provider <name>       t3code | claude-code | codex | ensemble | omp: this machine's agent (setup asks when unset)
   --t3-url <url>          T3 Code server (default ${DEFAULT_T3_URL}, env TENCIL_T3_URL)
   --model <model>         T3 Code: instance:model, e.g. claudeAgent:claude-fable-5-1
                           Claude Code: a model, e.g. claude-opus-5-5 (default: its default)
                           Codex: a model, e.g. gpt-6.1-sol (default: its default)
+                          OMP: an omp model selector, e.g. anthropic/claude-opus-5-5 (default: its settings)
   --runtime-mode <mode>   approval-required | auto-accept-edits | auto | full-access
   --listen <address>      Also listen here, e.g. a Tailscale IP for a remote browser (repeatable)
   --allow-origin <url>    Allow a non-localhost page to connect (repeatable)

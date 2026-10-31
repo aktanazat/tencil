@@ -224,7 +224,7 @@ function install(options: InitOptions, log: (message: string) => void): void {
         env: withoutNpmEnv(),
     });
     if (result.status !== 0) {
-        log(`  ${pc.yellow('!')} Install failed; run it yourself: ${command} ${args.join(' ')}\n`);
+        throw new Error(`Install failed; run it yourself: ${command} ${args.join(' ')}`);
     }
 }
 

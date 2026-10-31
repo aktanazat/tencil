@@ -32,6 +32,7 @@ export async function runDaemon(
             model: model.codex,
             permissions: codexPermissionsFor(runtimeMode),
         },
+        omp: { model: values.model as string | undefined },
         t3: {
             url: t3Url,
             modelSelection: model.t3,

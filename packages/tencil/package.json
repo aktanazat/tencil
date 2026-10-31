@@ -72,6 +72,7 @@
         "prepack": "turbo run build --filter=tencil"
     },
     "dependencies": {
+        "@agentclientprotocol/sdk": "^2.2.0",
         "magic-string": "^1.4.3",
         "oxc-parser": "^0.153.0",
         "picocolors": "^1.1.1",
@@ -102,6 +103,7 @@
         "@tencildev/provider-claude-code": "workspace:*",
         "@tencildev/provider-codex": "workspace:*",
         "@tencildev/provider-ensemble": "workspace:*",
+        "@tencildev/provider-omp": "workspace:*",
         "@tencildev/provider-t3code": "workspace:*",
         "@tencildev/testing": "workspace:*",
         "@tencildev/tsconfig": "workspace:*",

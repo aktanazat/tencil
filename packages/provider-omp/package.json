@@ -1,0 +1,19 @@
+{
+    "name": "@tencildev/provider-omp",
+    "version": "0.0.0",
+    "private": true,
+    "type": "module",
+    "exports": {
+        ".": "./src/index.ts"
+    },
+    "scripts": {
+        "typecheck": "tsc -p ."
+    },
+    "dependencies": {
+        "@agentclientprotocol/sdk": "^2.2.0",
+        "@tencildev/protocol": "workspace:*"
+    },
+    "devDependencies": {
+        "@tencildev/tsconfig": "workspace:*"
+    }
+}

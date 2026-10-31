@@ -9,7 +9,8 @@
         "../provider-t3code/src",
         "../provider-claude-code/src",
         "../provider-codex/src",
-        "../provider-ensemble/src"
+        "../provider-ensemble/src",
+        "../provider-omp/src"
     ],
     "exclude": ["**/*.test.ts"]
 }

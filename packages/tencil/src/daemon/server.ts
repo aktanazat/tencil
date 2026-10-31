@@ -28,6 +28,7 @@ import {
     ensembleThreadId,
     listEnsembleProjects,
 } from '@tencildev/provider-ensemble';
+import { OmpProvider } from '@tencildev/provider-omp';
 import {
     type CredentialStore,
     listT3Projects,
@@ -38,7 +39,7 @@ import {
 } from '@tencildev/provider-t3code';
 import { WebSocket, WebSocketServer } from 'ws';
 import { VERSION } from '../version.ts';
-import { machineProvider, PROVIDER_OPTIONS, type ProviderName } from './agents.ts';
+import { findOmp, machineProvider, PROVIDER_OPTIONS, type ProviderName } from './agents.ts';
 import { FilePreferences, preferencesPath } from './preferences.ts';
 import { type Detected, type Exec, ProjectResolver, projectKey } from './project-resolver.ts';
 import { FileProjectSettings, projectSettingsPath } from './project-settings.ts';
@@ -69,6 +70,8 @@ export interface DaemonOptions {
     codex?: Pick<CodexProviderOptions, 'model' | 'permissions' | 'command' | 'spawn'>;
     /** Ensemble's public local API. */
     ensemble?: { url?: string; credentials?: EnsembleCredentialStore };
+    /** OMP over `omp acp`; the command defaults to the `omp` found on this machine. */
+    omp?: { command?: string; model?: string };
     t3?: Pick<T3CodeProviderOptions, 'autoPair' | 'createPairingCode' | 'timeouts'> & {
         url?: string;
         token?: string;
@@ -164,6 +167,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<Daemon> 
 
     const claudeCodeDir = join(dataDir, 'claude-code');
     const t3Url = options.t3?.url ?? process.env.TENCIL_T3_URL;
+    const ompCommand = options.omp?.command ?? (await findOmp());
     const createProvider =
         options.createProvider ??
         ((root: string, id: string): Provider => {
@@ -188,6 +192,14 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<Daemon> 
                 return new EnsembleProvider({
                     projectRoot: root,
                     ...ensembleOptions,
+                    log: providerLog,
+                });
+            }
+            if (id === 'omp') {
+                return new OmpProvider({
+                    projectRoot: root,
+                    command: ompCommand,
+                    model: options.omp?.model,
                     log: providerLog,
                 });
             }

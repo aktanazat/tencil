@@ -1,3 +1,4 @@
+import { constants } from 'node:fs';
 import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
@@ -8,13 +9,14 @@ import { CredentialStore, DEFAULT_T3_URL } from '@tencildev/provider-t3code';
 import { z } from 'zod';
 import { defaultDataDir } from './thread-store.ts';
 
-export const PROVIDERS = ['t3code', 'claude-code', 'codex', 'ensemble'] as const;
+export const PROVIDERS = ['t3code', 'claude-code', 'codex', 'ensemble', 'omp'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 export const PROVIDER_OPTIONS: ProviderOption[] = [
     { id: 't3code', label: 'T3 Code' },
     { id: 'claude-code', label: 'Claude Code' },
     { id: 'codex', label: 'Codex' },
     { id: 'ensemble', label: 'Ensemble' },
+    { id: 'omp', label: 'OMP' },
 ];
 
 export const providerLabel = (id: ProviderName) =>
@@ -49,22 +51,29 @@ export async function saveProvider(provider: ProviderName, dataDir = defaultData
 
 /**
  * Which agents this machine has: a paired or running T3 Code, an installed
- * Claude Code, Codex's CLI or desktop app, a running Ensemble app.
+ * Claude Code, Codex's CLI or desktop app, a running Ensemble app, an installed OMP.
  */
 export async function detectAgents(
     options: { t3Url?: string } = {},
 ): Promise<Record<ProviderName, boolean>> {
-    const [t3code, claudeCode, ensemble] = await Promise.all([
+    const [t3code, claudeCode, ensemble, omp] = await Promise.all([
         hasT3Code(options.t3Url),
         hasClaudeCode(),
         hasEnsemble(),
+        findOmp(),
     ]);
-    return { t3code, 'claude-code': claudeCode, codex: findCodex() !== undefined, ensemble };
+    return {
+        t3code,
+        'claude-code': claudeCode,
+        codex: findCodex() !== undefined,
+        ensemble,
+        omp: omp !== undefined,
+    };
 }
 
 /**
  * The agent for projects that haven't picked one: the saved choice, else the
- * first agent found (T3 Code, Claude Code, Codex, Ensemble), else T3 Code.
+ * first agent found (T3 Code, Claude Code, Codex, Ensemble, OMP), else T3 Code.
  */
 export async function machineProvider(
     options: { dataDir?: string; t3Url?: string } = {},
@@ -75,7 +84,8 @@ export async function machineProvider(
     if (found.t3code) return 't3code';
     if (found['claude-code']) return 'claude-code';
     if (found.codex) return 'codex';
-    return found.ensemble ? 'ensemble' : 't3code';
+    if (found.ensemble) return 'ensemble';
+    return found.omp ? 'omp' : 't3code';
 }
 
 async function hasT3Code(t3Url: string | undefined): Promise<boolean> {
@@ -116,4 +126,29 @@ async function hasClaudeCode(): Promise<boolean> {
         ),
     );
     return found.includes(true);
+}
+
+/**
+ * The `omp` executable to run: `OMP_COMMAND` as given, else `omp` on the PATH,
+ * else Bun's global bin (login services get a bare PATH).
+ */
+export async function findOmp(): Promise<string | undefined> {
+    const override = process.env.OMP_COMMAND;
+    if (override) return override;
+    const name = process.platform === 'win32' ? 'omp.exe' : 'omp';
+    const candidates = [
+        ...(process.env.PATH ?? '')
+            .split(delimiter)
+            .filter(Boolean)
+            .map(dir => join(dir, name)),
+        join(homedir(), '.bun', 'bin', name),
+    ];
+    for (const path of candidates) {
+        const found = await access(path, constants.X_OK).then(
+            () => true,
+            () => false,
+        );
+        if (found) return path;
+    }
+    return undefined;
 }

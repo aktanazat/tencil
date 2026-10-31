@@ -34,8 +34,9 @@ every pin is a chat on the Ensemble thread serving your page.
 
 You need [T3 Code](https://github.com/pingdotgg/t3code) (the desktop app, running),
 [Claude Code](https://docs.claude.com/en/docs/claude-code) (installed and logged in),
-[Codex](https://github.com/openai/codex) (the CLI or desktop app, logged in) or
-[Ensemble](https://tryensemble.co) (the desktop app, running).
+[Codex](https://github.com/openai/codex) (the CLI or desktop app, logged in),
+[Ensemble](https://tryensemble.co) (the desktop app, running) or OMP (installed and
+logged in).
 
 ```sh
 cd your-app
@@ -167,6 +168,29 @@ is running when the daemon stops is lost; the pin turns red and you can follow u
 | `auto-accept-edits` | `workspace-write` | Refused |
 | `approval-required` | `read-only` | Refused |
 
+### OMP
+
+OMP support in this checkout is local-only, not published on npm. On this Mac, use
+the installed `~/.local/bin/tencil-omp` launcher rather than upstream `npx tencil`.
+
+With `--provider omp` (or OMP picked in a project's settings), the daemon runs
+`omp acp` in the project's folder, with your own OMP settings and login. There is
+nothing to pair or install. Tencil runs `omp` from the PATH, else `~/.bun/bin/omp`;
+set `OMP_COMMAND` to another executable. `--model` takes an omp model selector,
+e.g. `anthropic/claude-opus-5-5`; without it OMP uses its configured model.
+
+To run Tencil only while you use it, skip `setup` (it offers a login service):
+`~/.local/bin/tencil-omp init` adds the overlay and starts the daemon in the
+background, and `~/.local/bin/tencil-omp stop` ends it.
+
+Each pin is an OMP session, replayed from what OMP saved, so it survives a daemon
+restart. A session another omp is already writing to (in a terminal, say) is refused
+rather than opened twice. This ownership check currently supports macOS only;
+opening existing sessions on other systems is refused. Nobody is at a terminal
+to approve tool calls: tools follow your OMP configuration, Tencil approves nothing
+on its own, and `--runtime-mode` doesn't apply. OMP's projects don't show in the
+overlay's project picker.
+
 ## Using it
 
 | Action | How |
@@ -201,11 +225,12 @@ tencil service uninstall      Remove the login service
 tencil connect [pairing-link] Pair with T3 Code (automatic for a local T3 Code)
 
 --port <n>              Port (default 4747, env TENCIL_PORT)
---provider <name>       Agent for projects without their own: t3code (default) | claude-code | codex | ensemble
+--provider <name>       Agent for projects without their own: t3code (default) | claude-code | codex | ensemble | omp
 --t3-url <url>          T3 Code server (default: last paired, then http://127.0.0.1:3773)
 --model <model>         T3 Code: instance:model, e.g. claudeAgent:claude-fable-5-1
                         Claude Code: a model, e.g. claude-opus-5-5 (default: its default)
                         Codex: a model, e.g. gpt-6.1-sol (default: its default)
+                        OMP: an omp model selector, e.g. anthropic/claude-opus-5-5 (default: its settings)
 --runtime-mode <mode>   approval-required | auto-accept-edits | auto | full-access
 --listen <address>      Also listen here, e.g. a Tailscale IP (repeatable)
 --allow-origin <url>    Allow a non-localhost page to connect (repeatable)

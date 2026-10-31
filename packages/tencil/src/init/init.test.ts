@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -239,6 +239,27 @@ describe('planInit', () => {
         expect(output).toContain('TENCIL_CLOUD=<project key>');
         expect(output).toContain('Preview');
         expect(output).not.toMatch(/is running|Pair/);
+    });
+
+    it('rejects initialization when the package cannot be installed', async () => {
+        const root = project({
+            'package.json': '{"name":"tencil-install-failure","private":true}',
+            'package-lock.json': '{"lockfileVersion":3,"packages":{}}',
+            'vite.config.ts': CREATE_VITE_CONFIG,
+        });
+        try {
+            const result = runInit({
+                root,
+                yes: true,
+                skipPair: true,
+                from: join(root, 'missing.tgz'),
+                log: () => {},
+            });
+            await expect(result).rejects.toThrow(Error);
+            await expect(result).rejects.toThrow(/Install failed.*missing\.tgz/);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 
     it('finds the apps in a monorepo root, skipping node_modules', async () => {

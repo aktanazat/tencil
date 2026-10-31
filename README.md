@@ -14,8 +14,12 @@ Think Vercel Comments, except the reviewer on the other side is an agent.
 
 You need [T3 Code](https://github.com/pingdotgg/t3code) (the desktop app, running),
 [Claude Code](https://docs.claude.com/en/docs/claude-code) (installed and logged in),
-[Codex](https://github.com/openai/codex) (the CLI or desktop app, logged in) or
-[Ensemble](https://tryensemble.co) (the desktop app, running).
+[Codex](https://github.com/openai/codex) (the CLI or desktop app, logged in),
+[Ensemble](https://tryensemble.co) (the desktop app, running) or OMP (installed and
+logged in).
+
+This checkout adds local-only OMP support; it is not in the published npm package.
+On this Mac, use `~/.local/bin/tencil-omp init` in a web app instead of `npx tencil`.
 
 ```sh
 cd your-app
@@ -57,6 +61,10 @@ so every provider receives identical input: text and images.
   port identifies its Ensemble thread (including forwarded ports); each pin creates
   a chat on that thread's checkout. A page served from an Ensemble project's own folder
   starts a new thread per pin, archived when the pin is resolved or deleted. A shared feed streams chat messages and tool steps.
+- **OMP** (`@tencildev/provider-omp`): runs `omp acp` (the Agent Client Protocol
+  over stdio) in the project's folder with the user's own OMP settings and login.
+  Threads are OMP sessions, replayed from what OMP saved. Tools that would need
+  approval are never approved by Tencil.
 
 A new provider is a workspace package that implements `Provider`, with tests against
 a fake of the agent in `packages/testing`. The daemon picks the provider per project in
@@ -73,6 +81,7 @@ a fake of the agent in `packages/testing`. The daemon picks the provider per pro
 | `packages/provider-claude-code` | Claude Code provider (Claude Agent SDK) |
 | `packages/provider-codex` | Codex provider (`codex app-server`) |
 | `packages/provider-ensemble` | Ensemble provider (public local API and SSE feed) |
+| `packages/provider-omp` | OMP provider (`omp acp`, Agent Client Protocol) |
 | `packages/testing` | Fake T3 Code, Ensemble and Codex servers and fake Agent SDK used by the tests |
 | `packages/tsconfig` | Shared TypeScript configs |
 | `apps/playground` | Vite + React app with the plugin, also the e2e test target |

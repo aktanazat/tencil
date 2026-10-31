@@ -9,7 +9,7 @@ import {
     exchangePairingCredential,
 } from '@tencildev/provider-t3code';
 import pc from 'picocolors';
-import type { ProviderName } from '../daemon/agents.ts';
+import { findOmp, type ProviderName } from '../daemon/agents.ts';
 import { defaultDataDir } from '../daemon/thread-store.ts';
 
 /** Get the agent ready now, so the first page load is ready to go. */
@@ -21,6 +21,7 @@ export async function prepareProvider(
     if (provider === 'claude-code') return prepareClaudeCode(log);
     if (provider === 'codex') return checkCodex(log);
     if (provider === 'ensemble') return checkEnsemble(log);
+    if (provider === 'omp') return checkOmp(log);
     return pairWithLocalT3(t3Url, log);
 }
 
@@ -75,6 +76,16 @@ async function checkCodex(log: (message: string) => void): Promise<void> {
         problem
             ? `  ${pc.yellow('!')} ${problem.replace(/`([^`]+)`/g, (_, command) => pc.cyan(command))}`
             : `  ${pc.green('✓')} Codex is ready. Pins run in your Codex login.`,
+    );
+}
+
+/** OMP needs no pairing: the daemon runs `omp acp` with its own settings and login. */
+async function checkOmp(log: (message: string) => void): Promise<void> {
+    const command = await findOmp();
+    log(
+        command
+            ? `  ${pc.green('✓')} OMP is ready at ${command}. Pins run in your OMP settings and login.`
+            : `  ${pc.yellow('!')} OMP isn't installed. Install it, or set OMP_COMMAND to its path.`,
     );
 }
 

@@ -525,7 +525,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
     api.registerTool({
         name: 'mac_type',
         label: 'Type in app',
-        description: `Type non-secret text into the target app's focused control. Never type passwords, passkeys, one-time codes, or other secrets. At a sign-in or recovery prompt, call mac_handoff and stop. ${actionNote}`,
+        description: `Type non-secret text into the target app's focused control. Never put passwords, passkeys, one-time codes, or other secrets in this tool's arguments. Follow skill://macos-harness for credential input and human-only handoff. ${actionNote}`,
         approval: 'write',
         approvalCacheTargets: approvalTargets,
         parameters: z.object({

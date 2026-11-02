@@ -21,6 +21,12 @@ logged in).
 This checkout adds local-only OMP support; it is not in the published npm package.
 On this Mac, use `~/.local/bin/tencil-omp init` in a web app instead of `npx tencil`.
 
+The global OMP extension loads when a conversation starts or resumes. Resume
+the same saved conversation to load it in an older running chat; do not start
+a second writer. Native typing tools accept only non-secret text. Credential
+input follows the installed `macos-harness` skill, including its explicitly
+approved local test-VM exception; secrets must never enter tool arguments.
+
 ```sh
 cd your-app
 npx tencil

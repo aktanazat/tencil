@@ -375,9 +375,18 @@ async function invoke(request: DriverRequest, signal: AbortSignal | undefined): 
     if (request.expect?.state === 'equals' && request.expect.value === undefined) {
         throw new Error('An equals expectation requires value.');
     }
-    const reply = await inLane(request.app, () =>
-        driverFor(request.app).request(JSON.stringify(request), signal),
-    );
+    const { args } = request;
+    if (
+        request.verb === 'click' &&
+        !args.element &&
+        args.state_id === undefined &&
+        (args.x === undefined || args.y === undefined || !args.screenshot)
+    ) {
+        throw new Error(
+            'Provide a mac_state id, a mac_query element match, or x and y together with the screenshot path from mac_see.',
+        );
+    }
+    const reply = await driverFor(request.app).request(JSON.stringify(request), signal);
     if ('aborted' in reply || signal?.aborted) {
         const action = ['press', 'click', 'type', 'key'].includes(request.verb);
         throw new Error(
@@ -447,6 +456,76 @@ async function result(
         details,
         isError: !envelope.ok,
     };
+}
+
+interface Batch {
+    pending: number;
+    issued: number;
+    stopAfter: number;
+    failed: string;
+    ran: string[];
+}
+
+// A failed call stops the calls the same agent queued behind it for that
+// app, as a computer-use batch stops at its first failed action. A call
+// issued after the failure runs.
+const batches = new Map<string, Batch>();
+
+function failure(result: AgentToolResult<MacDetails>): string | undefined {
+    const data = result.details?.data ?? {};
+    const receipt = object(data.receipt);
+    if (!result.isError && receipt?.outcome !== 'failed') return undefined;
+    return string(object(data.error)?.code) ?? 'error';
+}
+
+function notRun(request: DriverRequest, batch: Batch): AgentToolResult<MacDetails> {
+    const message = `Not run: ${batch.failed} earlier in this turn, so this ${request.verb} for ${request.app} was skipped. Ran in order: ${batch.ran.join('; ')}. Read ${request.app} with mac_state before acting again.`;
+    return {
+        content: [{ type: 'text', text: message }],
+        details: { kind: 'error', app: request.app, data: { error: { code: 'not_run', message } } },
+        isError: true,
+    };
+}
+
+async function queued(
+    request: DriverRequest,
+    signal: AbortSignal | undefined,
+): Promise<AgentToolResult<MacDetails>> {
+    const key = `${request.agent_id}\n${request.app}`;
+    const batch = batches.get(key) ?? { pending: 0, issued: 0, stopAfter: 0, failed: '', ran: [] };
+    batches.set(key, batch);
+    batch.pending += 1;
+    const index = ++batch.issued;
+    const call = [request.verb, subject(request.verb, request.args)].filter(Boolean).join(' ');
+    const settle = (status: string, failed: boolean) => {
+        batch.ran.push(`${call} ${status}`);
+        if (!failed) return;
+        batch.failed = `${call} ${status}`;
+        batch.stopAfter = batch.issued;
+    };
+    try {
+        return await inLane(request.app, async () => {
+            if (index <= batch.stopAfter) return notRun(request, batch);
+            let answer: AgentToolResult<MacDetails>;
+            try {
+                answer = await result(request, signal);
+            } catch (error) {
+                settle('failed', true);
+                throw error;
+            }
+            const code = failure(answer);
+            settle(
+                code === undefined
+                    ? (string(object(answer.details?.data.receipt)?.outcome) ?? 'ok')
+                    : `failed (${code})`,
+                code !== undefined,
+            );
+            return answer;
+        });
+    } finally {
+        batch.pending -= 1;
+        if (batch.pending === 0) batches.delete(key);
+    }
 }
 
 export function registerMacHarness(api: ExtensionAPI): void {
@@ -521,7 +600,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
         }),
         ...presentation('See app', 'see'),
         async execute(_toolCallId, { app: targetApp, crop, ...args }, signal, _onUpdate, ctx) {
-            return result(
+            return queued(
                 {
                     verb: 'see',
                     app: targetApp,
@@ -540,7 +619,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
         name: 'mac_state',
         label: 'Read app',
         description:
-            'Read one native Mac app window as compact text, one control per line like [12] button "Save", without activating it. Prefer this to mac_see: it costs a fraction of a screenshot, and later reads print only what changed since your last one. Act on a line by passing its id as state_id to mac_press, or to mac_click for controls without a press. Use query to print only lines mentioning a word, from the whole window. Calls for one app run in the order you issue them, so one turn can hold several actions and end with mac_state. Take mac_see only when the text lacks what you need (images, layout, canvas apps). Use Safari tools for web pages.',
+            'Read one native Mac app window as compact text, one control per line like [12] button "Save", without activating it. Prefer this to mac_see: it costs a fraction of a screenshot, and later reads print only what changed since your last one. Act on a line by passing its id as state_id to mac_press, or to mac_click for controls without a press. Use query to print only lines mentioning a word, from the whole window. Calls for one app run in the order you issue them, so one turn can hold several actions and end with mac_state; when one fails, the calls after it in that turn are not run. Take mac_see only when the text lacks what you need (images, layout, canvas apps). Use Safari tools for web pages.',
         approval: 'read',
         parameters: z.object({
             app,
@@ -557,7 +636,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
         }),
         ...presentation('Read app', 'state'),
         async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
-            return result(
+            return queued(
                 { verb: 'state', app: targetApp, agent_id: macAgentId(ctx), args },
                 signal,
             );
@@ -578,7 +657,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
         }),
         ...presentation('Find controls', 'query'),
         async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
-            return result(
+            return queued(
                 { verb: 'query', app: targetApp, agent_id: macAgentId(ctx), args },
                 signal,
             );
@@ -611,7 +690,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
             _onUpdate,
             ctx,
         ) {
-            return result(
+            return queued(
                 {
                     verb: 'press',
                     app: targetApp,
@@ -663,16 +742,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
             _onUpdate,
             ctx,
         ) {
-            if (
-                !args.element &&
-                args.state_id === undefined &&
-                (args.x === undefined || args.y === undefined || !args.screenshot)
-            ) {
-                throw new Error(
-                    'Provide a mac_state id, a mac_query element match, or x and y together with the screenshot path from mac_see.',
-                );
-            }
-            return result(
+            return queued(
                 {
                     verb: 'click',
                     app: targetApp,
@@ -706,7 +776,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
             _onUpdate,
             ctx,
         ) {
-            return result(
+            return queued(
                 {
                     verb: 'type',
                     app: targetApp,
@@ -734,7 +804,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
             _onUpdate,
             ctx,
         ) {
-            return result(
+            return queued(
                 { verb: 'key', app: targetApp, agent_id: macAgentId(ctx), args, expect: condition },
                 signal,
             );
@@ -753,7 +823,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
         }),
         ...presentation('Ask for sign-in', 'handoff'),
         async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
-            return result(
+            return queued(
                 { verb: 'handoff', app: targetApp, agent_id: macAgentId(ctx), args },
                 signal,
             );

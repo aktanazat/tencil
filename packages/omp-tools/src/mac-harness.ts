@@ -7,8 +7,8 @@ import { kv, Text, text } from '@oh-my-pi/pi-tui';
 import type { Theme } from '@oh-my-pi/pi-tui/theme';
 import type { NativeToolView } from '@oh-my-pi/pi-tui/tools/renderer';
 
-type MacVerb = 'see' | 'query' | 'handoff' | 'press' | 'click' | 'type' | 'key';
-type ResultKind = 'see' | 'query' | 'handoff' | 'receipt' | 'error';
+type MacVerb = 'see' | 'state' | 'query' | 'handoff' | 'press' | 'click' | 'type' | 'key';
+type ResultKind = 'see' | 'state' | 'query' | 'handoff' | 'receipt' | 'error';
 type Tone = 'neutral' | 'success' | 'warning' | 'error';
 
 interface MacDetails {
@@ -41,7 +41,7 @@ interface Summary {
 const driver = fileURLToPath(new URL('./mac-driver.py', import.meta.url));
 const python = join(homedir(), '.local/share/uv/tools/macos-harness/bin/python');
 const actionNote =
-    'Does not activate the app or move the physical pointer. Never retry an action whose receipt says acted=yes or unknown before checking mac_see or mac_query.';
+    'Does not activate the app or move the physical pointer. Never retry an action whose receipt says acted=yes or unknown before checking mac_state, mac_see or mac_query.';
 
 function object(value: unknown): Record<string, unknown> | undefined {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
@@ -78,10 +78,13 @@ function subject(verb: MacVerb, args: unknown): string {
         return value === undefined ? '' : `${value.length} characters`;
     }
     if (verb === 'key') return string(values.key) ?? '';
-    if (verb === 'see')
-        return values.window_id === undefined ? '' : `window ${display(values.window_id)}`;
+    if (verb === 'see' || verb === 'state')
+        return values.window_id === undefined
+            ? (string(values.query) ?? '')
+            : `window ${display(values.window_id)}`;
     if (verb === 'handoff') return string(values.reason)?.replaceAll('_', ' ') ?? '';
     if (verb === 'click') {
+        if (typeof values.state_id === 'number') return `[${values.state_id}]`;
         const element = object(values.element);
         return element
             ? [element.role, element.title, element.description]
@@ -161,6 +164,15 @@ function summarize(result: AgentToolResult<MacDetails>): Summary {
             ],
             message: warnings.length ? warnings.join('\n') : undefined,
             tone: warnings.length ? 'warning' : 'neutral',
+        };
+    }
+    if (kind === 'state') {
+        const lines = (string(data.text) ?? '').split('\n');
+        return {
+            meta: [data.complete === false ? 'partial read' : `${lines.length} lines`],
+            facts: [],
+            message: lines.slice(0, 12).join('\n') + (lines.length > 12 ? '\n…' : ''),
+            tone: data.complete === false ? 'warning' : 'neutral',
         };
     }
     if (kind === 'query') {
@@ -246,6 +258,23 @@ function presentation(label: string, verb: MacVerb) {
     };
 }
 
+// OMP runs a turn's tool calls concurrently; a read issued after a click in
+// the same turn must see the click, so calls for one app run in issue order.
+const lanes = new Map<string, Promise<unknown>>();
+
+function inLane<T>(app: string, run: () => Promise<T>): Promise<T> {
+    const next = (lanes.get(app) ?? Promise.resolve()).then(run, run);
+    const settled = next.then(
+        () => undefined,
+        () => undefined,
+    );
+    lanes.set(app, settled);
+    void settled.then(() => {
+        if (lanes.get(app) === settled) lanes.delete(app);
+    });
+    return next;
+}
+
 async function invoke(
     api: ExtensionAPI,
     request: DriverRequest,
@@ -254,12 +283,14 @@ async function invoke(
     if (request.expect?.state === 'equals' && request.expect.value === undefined) {
         throw new Error('An equals expectation requires value.');
     }
-    const execution = await api.exec(python, [driver, JSON.stringify(request)], { signal });
+    const execution = await inLane(request.app, () =>
+        api.exec(python, [driver, JSON.stringify(request)], { signal }),
+    );
     if (execution.killed || signal?.aborted) {
         const action = ['press', 'click', 'type', 'key'].includes(request.verb);
         throw new Error(
             action
-                ? 'Mac input was interrupted. Whether input was sent is unknown. Run mac_see or mac_query before retrying.'
+                ? 'Mac input was interrupted. Whether input was sent is unknown. Run mac_state or mac_see before retrying.'
                 : 'Mac observation was interrupted.',
         );
     }
@@ -291,10 +322,9 @@ async function result(
     const { data } = envelope;
     let kind: ResultKind = 'error';
     if (envelope.ok) {
-        kind =
-            request.verb === 'see' || request.verb === 'query' || request.verb === 'handoff'
-                ? request.verb
-                : 'receipt';
+        kind = ['see', 'state', 'query', 'handoff'].includes(request.verb)
+            ? (request.verb as ResultKind)
+            : 'receipt';
     }
     const details: MacDetails = { kind, app: request.app, data };
     if (kind === 'see') {
@@ -312,6 +342,9 @@ async function result(
             ],
             details,
         };
+    }
+    if (kind === 'state') {
+        return { content: [{ type: 'text', text: string(data.text) ?? '' }], details };
     }
     const summary =
         kind === 'handoff'
@@ -417,6 +450,35 @@ export function registerMacHarness(api: ExtensionAPI): void {
     });
 
     api.registerTool({
+        name: 'mac_state',
+        label: 'Read app',
+        description:
+            'Read one native Mac app window as compact text, one control per line like [12] button "Save", without activating it. Prefer this to mac_see: it costs a fraction of a screenshot, and later reads print only what changed since your last one. Pass an id to mac_click as state_id. Use query to print only lines mentioning a word, from the whole window. Calls for one app run in the order you issue them, so one turn can hold several actions and end with mac_state. Take mac_see only when the text lacks what you need (images, layout, canvas apps). Use Safari tools for web pages.',
+        approval: 'read',
+        parameters: z.object({
+            app,
+            query: z
+                .string()
+                .min(1)
+                .describe('Only lines mentioning this text, with their ancestors.')
+                .optional(),
+            window_id: windowId,
+            diff: z
+                .boolean()
+                .describe('Default true; false prints the whole window, as after context loss.')
+                .optional(),
+        }),
+        ...presentation('Read app', 'state'),
+        async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
+            return result(
+                api,
+                { verb: 'state', app: targetApp, agent_id: macAgentId(ctx), args },
+                signal,
+            );
+        },
+    });
+
+    api.registerTool({
         name: 'mac_query',
         label: 'Find controls',
         description:
@@ -470,7 +532,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
     api.registerTool({
         name: 'mac_click',
         label: 'Click app',
-        description: `Click a mac_query element match, or screenshot pixels using x, y, and the PNG path returned by mac_see. A menu, popover, or panel needs its own window_id. ${actionNote}`,
+        description: `Click a mac_state id (state_id), a mac_query element match, or screenshot pixels using x, y, and the PNG path returned by mac_see. A menu, popover, or panel needs its own window_id. ${actionNote}`,
         approval: 'write',
         approvalCacheTargets: approvalTargets,
         parameters: z.object({
@@ -485,6 +547,12 @@ export function registerMacHarness(api: ExtensionAPI): void {
             element: z
                 .record(z.unknown())
                 .describe('An entire match returned by mac_query.')
+                .optional(),
+            state_id: z
+                .number()
+                .int()
+                .nonnegative()
+                .describe('An id from the last mac_state of this app.')
                 .optional(),
             window_id: windowId,
             button: z.enum(['left', 'right', 'middle']).optional(),
@@ -502,10 +570,11 @@ export function registerMacHarness(api: ExtensionAPI): void {
         ) {
             if (
                 !args.element &&
+                args.state_id === undefined &&
                 (args.x === undefined || args.y === undefined || !args.screenshot)
             ) {
                 throw new Error(
-                    'Provide a mac_query element match, or x and y together with the screenshot path from mac_see.',
+                    'Provide a mac_state id, a mac_query element match, or x and y together with the screenshot path from mac_see.',
                 );
             }
             return result(

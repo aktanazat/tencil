@@ -11,10 +11,11 @@ from macos_harness.errors import ErrorCode
 SELECTORS = {"text", "role", "title", "identifier", "description"}
 ARGUMENTS = {
     "see": {"window_index", "window_id", "crop", "zoom"},
+    "state": {"query", "window_id", "diff"},
     "query": SELECTORS | {"limit", "visible_only"},
     "handoff": {"reason"},
     "press": SELECTORS | {"timeout"},
-    "click": {"x", "y", "element", "window_id", "screenshot", "button", "clicks", "timeout"},
+    "click": {"x", "y", "element", "state_id", "window_id", "screenshot", "button", "clicks", "timeout"},
     "type": {"text", "window_id", "timeout"},
     "key": {"key", "window_id", "timeout"},
 }
@@ -63,12 +64,22 @@ def run(request: dict[str, object]) -> object:
             if crop is not None:
                 values["crop"] = tuple(crop)
             return mac.see(app, **values)
+        if verb == "state":
+            state = mac.state(app, **values)
+            return {"text": state.text, "complete": state.complete}
         if verb == "query":
             matches = mac.ax.query(app=app, **values)
             return {"matches": list(matches), "complete": matches.complete, "visited": matches.visited}
         if verb == "handoff":
             handoff = mac.handoff(app=app, **values)
             return {"handoff": handoff.to_json(), "prompt": handoff.to_prompt()}
+        state_id = values.pop("state_id", None)
+        if state_id is not None:
+            state = mac.state(app, window_id=values.get("window_id"))
+            try:
+                values["element"] = state[state_id]
+            except KeyError as exc:
+                raise MacOSError(exc.args[0], code=ErrorCode.ELEMENT_UNKNOWN) from None
         expect = request.get("expect")
         if expect is not None:
             values["postcondition"] = postcondition(expect)

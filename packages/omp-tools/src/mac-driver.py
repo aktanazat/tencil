@@ -5,13 +5,26 @@ import json
 import plistlib
 import signal
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
-from macos_harness import MacOS, MacOSError, OperationError, equals, gone, present
+from macos_harness import (
+    MacOS,
+    MacOSError,
+    OperationError,
+    Postcondition,
+    Receipt,
+    equals,
+    gone,
+    present,
+)
 from macos_harness.errors import ErrorCode
 
 SELECTORS = {"text", "role", "title", "identifier", "description"}
+# The fields a route finds a control by, in the order mac.state labels it.
+NAMES = ("title", "description", "identifier")
 ARGUMENTS = {
     "see": {"window_index", "window_id", "crop", "zoom"},
     "state": {"query", "window_id", "diff"},
@@ -22,14 +35,49 @@ ARGUMENTS = {
     "type": {"text", "window_id", "timeout"},
     "key": {"key", "window_id", "timeout"},
     "script": {"source", "language", "timeout"},
+    "route": {"action", "name", "entry", "goal", "inputs", "timeout"},
 }
+INPUT = {"press", "click", "type", "key", "script"}
 SCRIPTABLE = "This app is scriptable: prefer one mac_script to a series of clicks"
+# A recording spans the agent's turns, and the harness gives it one deadline.
+RECORDING_S = 600.0
+CHECK_S = 2.0
+STEP_S = 5.0
+
+
+class Recorder(Protocol):
+    def press(
+        self, *, role: str, postcondition: Postcondition, title: str | None = None,
+        identifier: str | None = None, description: str | None = None,
+    ) -> Receipt: ...
+
+    def key(self, key: str, *, postcondition: Postcondition) -> Receipt: ...
+
+
+@dataclass
+class Recording:
+    name: str
+    context: contextlib.AbstractContextManager[Recorder]
+    recorder: Recorder
+    steps: int = 0
+    started: float = field(default_factory=time.monotonic)
+
+    def drop(self, reason: MacOSError) -> None:
+        self.context.__exit__(type(reason), reason, reason.__traceback__)
 
 
 @dataclass
 class Session:
     macs: dict[str, MacOS] = field(default_factory=dict)
     scriptable: dict[str | int, bool] = field(default_factory=dict)
+    recordings: dict[str, Recording] = field(default_factory=dict)
+
+    def hold(self) -> float:
+        now = time.monotonic()
+        return max(
+            (RECORDING_S - (now - recording.started) for recording in self.recordings.values()),
+            default=0.0,
+        )
 
 
 def arguments(values: dict[str, object], allowed: set[str]) -> dict[str, object]:
@@ -41,13 +89,15 @@ def arguments(values: dict[str, object], allowed: set[str]) -> dict[str, object]
     return {key: value for key, value in values.items() if value is not None}
 
 
-def postcondition(expect: dict[str, object]):
+def postcondition(expect: dict[str, object], timeout: object = None):
     state = expect.get("state")
     allowed = SELECTORS | {"state"}
     if state == "equals":
         allowed |= {"value", "attribute"}
     values = arguments(expect, allowed)
     values.pop("state", None)
+    if timeout is not None:
+        values["timeout"] = timeout
     if state == "present":
         return present(**values)
     if state == "gone":
@@ -57,6 +107,24 @@ def postcondition(expect: dict[str, object]):
             raise MacOSError("An equals expectation requires value", code=ErrorCode.BAD_REQUEST)
         return equals(**values)
     raise MacOSError(f"Unknown expectation state: {state!r}", code=ErrorCode.BAD_REQUEST)
+
+
+def exact(expect: object, what: str, timeout: object):
+    if not isinstance(expect, dict):
+        raise MacOSError(f"{what} is required", code=ErrorCode.BAD_REQUEST)
+    named = [name for name in NAMES if expect.get(name)]
+    if not expect.get("role") or len(named) != 1 or expect.get("text") is not None:
+        raise MacOSError(
+            f"{what} needs role and exactly one of title, description or identifier, "
+            "without text: a route finds a control again by those alone",
+            code=ErrorCode.BAD_REQUEST,
+        )
+    if expect.get("state") == "equals" and type(expect.get("value")) not in (bool, int, float):
+        raise MacOSError(
+            f"{what} can compare only true, false or a number in a route",
+            code=ErrorCode.BAD_REQUEST,
+        )
+    return postcondition(expect, timeout)
 
 
 def annotated(exc: MacOSError, note: str) -> MacOSError:
@@ -80,6 +148,131 @@ def scriptable(path: object) -> bool:
     )
 
 
+def held(mac: MacOS, app: str | int, state_id: object, window_id: object = None) -> dict[str, object]:
+    state = mac.state(app, window_id=window_id)
+    try:
+        return state[state_id]
+    except KeyError as exc:
+        raise MacOSError(exc.args[0], code=ErrorCode.ELEMENT_UNKNOWN) from None
+
+
+def locator(mac: MacOS, app: str | int, values: dict[str, object]) -> dict[str, str]:
+    state_id = values.pop("state_id", None)
+    if state_id is not None:
+        element = held(mac, app, state_id)
+    else:
+        matches = mac.ax.query(app=app, limit=2, **{key: values[key] for key in SELECTORS & values.keys()})
+        if len(matches) != 1:
+            raise MacOSError(
+                "These selectors do not match exactly one control; nothing was sent and the "
+                "recording stays open",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+            )
+        element = matches[0]
+    role = element.get("role")
+    for name in NAMES:
+        label = element.get(name)
+        if isinstance(role, str) and isinstance(label, str) and label:
+            found = mac.ax.query(app=app, role=role, limit=2, **{name: label})
+            if len(found) == 1 and found.complete:
+                return {"role": role, name: label}
+    raise MacOSError(
+        "No title, description or identifier names this control alone, so a route could not "
+        "find it again; nothing was sent and the recording stays open",
+        code=ErrorCode.ELEMENT_UNKNOWN,
+    )
+
+
+def record(
+    session: Session, mac: MacOS, agent_id: str, app: str | int, verb: str,
+    values: dict[str, object], expect: object,
+) -> dict[str, object]:
+    recording = session.recordings[agent_id]
+    if verb not in ("press", "key") or "window_id" in values:
+        raise MacOSError(
+            f"The recording {recording.name} saves mac_press and mac_key steps without window_id, "
+            f"so this {verb} was not sent; save or cancel the recording first",
+            code=ErrorCode.BAD_REQUEST,
+        )
+    if expect is None:
+        raise MacOSError(
+            "A recorded step needs expect, which replay checks after it; nothing was sent and "
+            "the recording stays open",
+            code=ErrorCode.BAD_REQUEST,
+        )
+    try:
+        condition = exact(expect, "expect", values.get("timeout", STEP_S))
+    except MacOSError as exc:
+        raise annotated(exc, "Nothing was sent and the recording stays open") from None
+    target = None if verb == "key" else locator(mac, app, values)
+    try:
+        if target is None:
+            receipt = recording.recorder.key(values["key"], postcondition=condition)
+        else:
+            receipt = recording.recorder.press(postcondition=condition, **target)
+    except MacOSError as exc:
+        del session.recordings[agent_id]
+        recording.drop(exc)
+        raise annotated(
+            exc, f"The recording {recording.name} ended without saving; mac_route record starts it again"
+        ) from exc
+    recording.steps += 1
+    return {
+        "receipt": receipt.to_json(),
+        "summary": f"{receipt}; saved as step {recording.steps} of {recording.name}",
+    }
+
+
+def route(
+    session: Session, mac: MacOS, agent_id: str, app: str | int, values: dict[str, object]
+) -> dict[str, object]:
+    action = values.get("action")
+    recording = session.recordings.get(agent_id)
+    if action in ("save", "cancel"):
+        if recording is None:
+            raise MacOSError(
+                "No recording is open for this app; mac_route record starts one",
+                code=ErrorCode.BAD_REQUEST,
+            )
+        del session.recordings[agent_id]
+        if action == "cancel":
+            recording.drop(MacOSError("Cancelled", code=ErrorCode.BAD_REQUEST))
+            return {"cancelled": recording.name}
+        try:
+            recording.context.__exit__(None, None, None)
+        except MacOSError as exc:
+            raise annotated(exc, f"{recording.name} was not saved, and its recording is closed") from exc
+        return {"saved": recording.name, "steps": recording.steps}
+    if recording is not None and action != "list":
+        raise MacOSError(
+            f"The recording {recording.name} is open; save or cancel it first",
+            code=ErrorCode.BAD_REQUEST,
+        )
+    bundle = mac.status(app)["app"]["bundle_id"]
+    if not isinstance(bundle, str):
+        raise MacOSError("This app has no bundle identifier, so it keeps no routes", code=ErrorCode.BAD_REQUEST)
+    name = values.get("name")
+    if action == "list":
+        return {"routes": mac.route.list(app=bundle)}
+    if action == "run":
+        result = mac.route.run(
+            name, app=bundle, timeout=values.get("timeout", 30.0), inputs=values.get("inputs")
+        )
+        return {"run": result.to_json(), "steps": [str(receipt) for receipt in result.steps_run]}
+    if action == "record":
+        context = mac.route.record(
+            name, app=bundle, entry=exact(values.get("entry"), "entry", CHECK_S),
+            goal=exact(values.get("goal"), "goal", CHECK_S), timeout=RECORDING_S,
+        )
+        try:
+            recorder = context.__enter__()
+        except MacOSError as exc:
+            raise annotated(exc, "No recording started") from exc
+        session.recordings[agent_id] = Recording(name, context, recorder)
+        return {"recording": name, "app": bundle}
+    raise MacOSError(f"Unknown route action: {action!r}", code=ErrorCode.BAD_REQUEST)
+
+
 def run(session: Session, request: dict[str, object]) -> object:
     verb = request["verb"]
     if verb not in ARGUMENTS:
@@ -94,6 +287,10 @@ def run(session: Session, request: dict[str, object]) -> object:
     mac = session.macs.get(agent_id)
     if mac is None:
         mac = session.macs[agent_id] = MacOS(agent_id=agent_id)
+    if verb == "route":
+        return route(session, mac, agent_id, app, values)
+    if agent_id in session.recordings and verb in INPUT:
+        return record(session, mac, agent_id, app, verb, values, request.get("expect"))
     if verb == "see":
         crop = values.get("crop")
         if crop is not None:
@@ -120,11 +317,7 @@ def run(session: Session, request: dict[str, object]) -> object:
         return {"output": mac.script(**values)}
     state_id = values.pop("state_id", None)
     if state_id is not None:
-        state = mac.state(app, window_id=values.get("window_id"))
-        try:
-            values["element"] = state[state_id]
-        except KeyError as exc:
-            raise MacOSError(exc.args[0], code=ErrorCode.ELEMENT_UNKNOWN) from None
+        values["element"] = held(mac, app, state_id, values.get("window_id"))
     expect = request.get("expect")
     if expect is not None:
         values["postcondition"] = postcondition(expect)
@@ -140,19 +333,23 @@ def interrupt(_signal: int, _frame: object) -> None:
 def answer(session: Session, line: str) -> dict[str, object]:
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            return {"ok": True, "result": run(session, json.loads(line))}
+            reply: dict[str, object] = {"ok": True, "result": run(session, json.loads(line))}
     except MacOSError as exc:
-        return {
+        reply = {
             "ok": False,
             "error": exc.to_json(),
             "receipt": exc.receipt.to_json() if isinstance(exc, OperationError) else None,
         }
+    hold = session.hold()
+    if hold > 0:
+        reply["hold"] = round(hold, 1)
+    return reply
 
 
 def main() -> int:
     """Answer one JSON request a line, in order, until stdin closes. One
-    process serves one app, so its MacOS instances, imports and pointer
-    helper outlive a single call."""
+    process serves one app, so its MacOS instances, imports, pointer helper
+    and open route recordings outlive a single call."""
     signal.signal(signal.SIGTERM, interrupt)
     session = Session()
     try:

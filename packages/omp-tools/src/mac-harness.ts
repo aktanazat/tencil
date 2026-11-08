@@ -17,8 +17,9 @@ type MacVerb =
     | 'click'
     | 'type'
     | 'key'
-    | 'script';
-type ResultKind = 'see' | 'state' | 'query' | 'handoff' | 'receipt' | 'script' | 'error';
+    | 'script'
+    | 'route';
+type ResultKind = 'see' | 'state' | 'query' | 'handoff' | 'receipt' | 'script' | 'route' | 'error';
 type Tone = 'neutral' | 'success' | 'warning' | 'error';
 
 interface MacDetails {
@@ -89,6 +90,8 @@ function subject(verb: MacVerb, args: unknown): string {
     }
     if (verb === 'key') return string(values.key) ?? '';
     if (verb === 'script') return string(values.language) ?? 'AppleScript';
+    if (verb === 'route')
+        return [values.action, values.name].filter(value => typeof value === 'string').join(' ');
     if (verb === 'see' || verb === 'state')
         return values.window_id === undefined
             ? (string(values.query) ?? '')
@@ -119,6 +122,68 @@ function receiptFacts(receipt: Record<string, unknown>): [string, string][] {
     if (typeof receipt.duration_s === 'number')
         facts.push(['duration', `${receipt.duration_s.toFixed(2)}s`]);
     return facts;
+}
+
+function replayNote(app: string, run: Record<string, unknown>): string {
+    const steps = Array.isArray(run.steps_run) ? run.steps_run.map(object) : [];
+    if (run.status === 'done') {
+        const seconds =
+            typeof run.duration_s === 'number' ? ` in ${run.duration_s.toFixed(2)}s` : '';
+        return `Replayed ${steps.length} steps${seconds}; the goal holds.`;
+    }
+    if (run.status === 'already') return 'The goal already holds, so nothing ran.';
+    const error = object(run.error) ?? {};
+    const reason = string(error.message) ?? display(error.code);
+    if (run.status !== 'diverged') {
+        return `The route did not run: ${reason}. mac_route list shows the routes saved for ${app}.`;
+    }
+    const at = string(run.at) ?? '';
+    const index = /^steps\[(\d+)\]$/.exec(at)?.[1];
+    const step = index === undefined ? undefined : steps[Number(index)];
+    const request =
+        object(
+            index === undefined ? object(object(run.check)?.request)?.condition : step?.request,
+        ) ??
+        object(object(error.details)?.query) ??
+        {};
+    const label = [request.title, request.description, request.identifier].find(
+        value => typeof value === 'string' && value.length > 0,
+    );
+    const place =
+        index !== undefined
+            ? `step ${Number(index) + 1} did not confirm (it acted: ${display(step?.acted ?? 'no')}), after the steps before it ran`
+            : at === 'entry'
+              ? `${app} is not where the route starts, so no step ran`
+              : at === 'goal'
+                ? steps.length
+                    ? 'every step ran, but the goal does not hold'
+                    : 'the goal could not be checked, so no step ran'
+                : `${app} is not the app the route was recorded in, so no step ran`;
+    return `Replay stopped: ${place}. ${reason}. Read ${app} with mac_state${label ? ` (query "${display(label)}")` : ''} before acting, and replay only from the route's start.`;
+}
+
+function routeNote(app: string, data: Record<string, unknown>): string {
+    if (typeof data.recording === 'string') {
+        return `Recording ${data.recording}: your mac_press and mac_key calls on ${app} are saved as its steps, each with its expect, until mac_route save.`;
+    }
+    if (typeof data.saved === 'string') {
+        return `Saved ${data.saved} with ${display(data.steps)} steps; mac_route run replays it in one call.`;
+    }
+    if (typeof data.cancelled === 'string') {
+        return `Dropped the recording ${data.cancelled}; nothing was saved.`;
+    }
+    if (Array.isArray(data.routes)) {
+        const lines = data.routes.map(route => {
+            const item = object(route) ?? {};
+            const inputs =
+                Array.isArray(item.inputs) && item.inputs.length
+                    ? `, inputs ${item.inputs.join(', ')}`
+                    : '';
+            return `${display(item.name)}: ${display(item.steps)} steps${inputs}`;
+        });
+        return lines.length ? lines.join('\n') : `No routes saved for ${app}.`;
+    }
+    return replayNote(app, object(data.run) ?? {});
 }
 
 function summarize(result: AgentToolResult<MacDetails>): Summary {
@@ -206,6 +271,15 @@ function summarize(result: AgentToolResult<MacDetails>): Summary {
             tone: data.complete === false ? 'warning' : 'neutral',
         };
     }
+    if (kind === 'route') {
+        const run = object(data.run);
+        return {
+            meta: run ? [display(run.status)] : [],
+            facts: [],
+            message: routeNote(details.app, data),
+            tone: run && run.status !== 'done' && run.status !== 'already' ? 'error' : 'neutral',
+        };
+    }
     return {
         meta: ['needs you'],
         facts: [],
@@ -288,7 +362,15 @@ function inLane<T>(app: string, run: () => Promise<T>): Promise<T> {
 
 const IDLE_MS = 60_000;
 
-type Reply = { line: string } | { exited: string } | { aborted: true };
+type Reply = { line: string; value: unknown } | { exited: string } | { aborted: true };
+
+function parse(line: string): unknown {
+    try {
+        return JSON.parse(line);
+    } catch {
+        return undefined;
+    }
+}
 
 // One warm python per app answers that app's calls in order, so a call
 // skips the import, the MacOS setup and the pointer helper's restart.
@@ -306,7 +388,7 @@ class Driver {
             for (let end = this.buffer.indexOf('\n'); end >= 0; end = this.buffer.indexOf('\n')) {
                 const line = this.buffer.slice(0, end);
                 this.buffer = this.buffer.slice(end + 1);
-                this.settle({ line });
+                this.settle({ line, value: parse(line) });
             }
         });
         this.child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
@@ -339,7 +421,12 @@ class Driver {
         this.waiting = reply => {
             signal?.removeEventListener('abort', abort);
             if ('line' in reply) {
-                this.idle = setTimeout(() => this.stop(), IDLE_MS);
+                // An open route recording lives in this process; idling out would drop it.
+                const hold = object(reply.value)?.hold;
+                this.idle = setTimeout(
+                    () => this.stop(),
+                    typeof hold === 'number' ? Math.max(IDLE_MS, hold * 1000) : IDLE_MS,
+                );
                 this.idle.unref();
             }
             resolve(reply);
@@ -398,7 +485,7 @@ async function invoke(request: DriverRequest, signal: AbortSignal | undefined): 
     }
     const reply = await driverFor(request.app).request(JSON.stringify(request), signal);
     if ('aborted' in reply || signal?.aborted) {
-        const action = ['press', 'click', 'type', 'key', 'script'].includes(request.verb);
+        const action = ['press', 'click', 'type', 'key', 'script', 'route'].includes(request.verb);
         throw new Error(
             action
                 ? 'Mac input was interrupted. Whether input was sent is unknown. Run mac_state or mac_see before retrying.'
@@ -406,17 +493,13 @@ async function invoke(request: DriverRequest, signal: AbortSignal | undefined): 
         );
     }
     if ('exited' in reply) throw new Error(`Mac harness exited without a result. ${reply.exited}`);
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(reply.line);
-    } catch {
-        throw new Error(`Mac harness answered without a valid result. ${reply.line}`);
+    const envelope = object(reply.value);
+    if (envelope?.ok === false && object(envelope.error)) {
+        return { ok: false, data: { ok: false, error: envelope.error, receipt: envelope.receipt } };
     }
-    const envelope = object(parsed);
-    if (envelope?.ok === false && object(envelope.error)) return { ok: false, data: envelope };
     const data = object(envelope?.result);
     if (envelope?.ok !== true || !data) {
-        throw new Error(`Mac harness answered without a successful result. ${reply.line}`);
+        throw new Error(`Mac harness answered without a valid result. ${reply.line}`);
     }
     return { ok: true, data };
 }
@@ -462,6 +545,23 @@ async function result(
             details,
         };
     }
+    if (kind === 'route') {
+        const run = object(data.run);
+        const stopped = run !== undefined && run.status !== 'done' && run.status !== 'already';
+        const steps = Array.isArray(data.steps) ? data.steps.join('\n') : '';
+        return {
+            content: [
+                {
+                    type: 'text',
+                    text: [routeNote(request.app, data), stopped ? JSON.stringify(run) : steps]
+                        .filter(Boolean)
+                        .join('\n'),
+                },
+            ],
+            details,
+            isError: stopped,
+        };
+    }
     const summary =
         kind === 'handoff'
             ? string(data.prompt)
@@ -494,7 +594,7 @@ function failure(result: AgentToolResult<MacDetails>): string | undefined {
     const data = result.details?.data ?? {};
     const receipt = object(data.receipt);
     if (!result.isError && receipt?.outcome !== 'failed') return undefined;
-    return string(object(data.error)?.code) ?? 'error';
+    return string(object(data.error ?? object(data.run)?.error)?.code) ?? 'error';
 }
 
 function notRun(request: DriverRequest, batch: Batch): AgentToolResult<MacDetails> {
@@ -571,19 +671,19 @@ export function registerMacHarness(api: ExtensionAPI): void {
         identifier: z.string().describe('Accessibility identifier.').optional(),
         description: z.string().describe('Accessibility description.').optional(),
     };
-    const expect = z
-        .object({
-            state: z.enum(['present', 'gone', 'equals']),
-            ...selectors,
-            value: z
-                .union([z.string(), z.number(), z.boolean()])
-                .describe('Required for equals.')
-                .optional(),
-            attribute: z
-                .string()
-                .describe('Attribute compared by equals; defaults to AXValue.')
-                .optional(),
-        })
+    const condition = z.object({
+        state: z.enum(['present', 'gone', 'equals']),
+        ...selectors,
+        value: z
+            .union([z.string(), z.number(), z.boolean()])
+            .describe('Required for equals.')
+            .optional(),
+        attribute: z
+            .string()
+            .describe('Attribute compared by equals; defaults to AXValue.')
+            .optional(),
+    });
+    const expect = condition
         .describe('Optional condition verified in the target app after input.')
         .optional();
 
@@ -686,7 +786,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
     api.registerTool({
         name: 'mac_press',
         label: 'Press control',
-        description: `Press a control by its mac_state id (state_id), or one control uniquely matched by selectors. Prefer state_id: it skips the search and works in background windows, while a name mac_state prints may be a title or a description. ${actionNote}`,
+        description: `Press a control by its mac_state id (state_id), or one control uniquely matched by selectors. Prefer state_id: it skips the search and works in background windows, while a name mac_state prints may be a title or a description. While a mac_route recording is open, the press is saved as a step and needs expect. ${actionNote}`,
         approval: 'write',
         approvalCacheTargets: approvalTargets,
         parameters: z.object({
@@ -811,7 +911,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
     api.registerTool({
         name: 'mac_key',
         label: 'Send key',
-        description: `Send one key or shortcut to a native app. Join modifiers with + or -, such as cmd+n or cmd+shift+t; named keys include return and escape. Use mac_type for text, not mac_key. ${actionNote}`,
+        description: `Send one key or shortcut to a native app. Join modifiers with + or -, such as cmd+n or cmd+shift+t; named keys include return and escape. Use mac_type for text, not mac_key. While a mac_route recording is open, the key is saved as a step and needs expect. ${actionNote}`,
         approval: 'write',
         approvalCacheTargets: approvalTargets,
         parameters: z.object({ app, key: z.string().min(1), window_id: windowId, timeout, expect }),
@@ -853,6 +953,44 @@ export function registerMacHarness(api: ExtensionAPI): void {
         async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
             return queued(
                 { verb: 'script', app: targetApp, agent_id: macAgentId(ctx), args },
+                signal,
+            );
+        },
+    });
+
+    api.registerTool({
+        name: 'mac_route',
+        label: 'Saved route',
+        description:
+            "Save presses and keys in one app as a named route while you do a task once, then replay it later in one call. record starts a recording: give name, entry (true now) and goal (true once done, not now), each naming a control by role and one exact title, description or identifier. Until save, your mac_press and mac_key calls on this app are saved as steps and each needs such an expect; mac_click, mac_type and mac_script calls on it are refused. save checks the goal and writes the route, cancel drops it, and a recording closes after 10 minutes. run replays a saved route and stops at the first step that does not confirm; list shows this app's routes.",
+        approval: 'write',
+        approvalCacheTargets: approvalTargets,
+        parameters: z.object({
+            app,
+            action: z.enum(['record', 'save', 'cancel', 'run', 'list']),
+            name: z
+                .string()
+                .regex(/^[a-z0-9-]{1,64}$/)
+                .describe('Route name for record and run: lowercase letters, digits and hyphens.')
+                .optional(),
+            entry: condition.describe('record: true now, before the first step.').optional(),
+            goal: condition
+                .describe('record: true once the route is done, and false now.')
+                .optional(),
+            inputs: z
+                .record(z.string(), z.string())
+                .describe('run: text for each input the route lists; never secrets.')
+                .optional(),
+            timeout: z
+                .number()
+                .positive()
+                .describe('run: seconds for the whole replay, default 30.')
+                .optional(),
+        }),
+        ...presentation('Saved route', 'route'),
+        async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
+            return queued(
+                { verb: 'route', app: targetApp, agent_id: macAgentId(ctx), args },
                 signal,
             );
         },

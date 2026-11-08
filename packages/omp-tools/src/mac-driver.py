@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import plistlib
 import signal
 import sys
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from macos_harness import MacOS, MacOSError, OperationError, equals, gone, present
 from macos_harness.errors import ErrorCode
@@ -18,7 +21,15 @@ ARGUMENTS = {
     "click": {"x", "y", "element", "state_id", "window_id", "screenshot", "button", "clicks", "timeout"},
     "type": {"text", "window_id", "timeout"},
     "key": {"key", "window_id", "timeout"},
+    "script": {"source", "language", "timeout"},
 }
+SCRIPTABLE = "This app is scriptable: prefer one mac_script to a series of clicks"
+
+
+@dataclass
+class Session:
+    macs: dict[str, MacOS] = field(default_factory=dict)
+    scriptable: dict[str | int, bool] = field(default_factory=dict)
 
 
 def arguments(values: dict[str, object], allowed: set[str]) -> dict[str, object]:
@@ -48,7 +59,28 @@ def postcondition(expect: dict[str, object]):
     raise MacOSError(f"Unknown expectation state: {state!r}", code=ErrorCode.BAD_REQUEST)
 
 
-def run(macs: dict[str, MacOS], request: dict[str, object]) -> object:
+def annotated(exc: MacOSError, note: str) -> MacOSError:
+    message = f"{str(exc).rstrip('.')}. {note}"
+    if isinstance(exc, OperationError):
+        return OperationError(message, receipt=exc.receipt, code=exc.code, details=exc.details)
+    return MacOSError(message, code=exc.code, details=exc.details)
+
+
+def scriptable(path: object) -> bool:
+    if not isinstance(path, str):
+        return False
+    try:
+        with Path(path, "Contents", "Info.plist").open("rb") as source:
+            info = plistlib.load(source)
+    except (OSError, ValueError):
+        return False
+    return isinstance(info, dict) and (
+        str(info.get("NSAppleScriptEnabled")).lower() in ("1", "true", "yes")
+        or bool(info.get("OSAScriptingDefinition"))
+    )
+
+
+def run(session: Session, request: dict[str, object]) -> object:
     verb = request["verb"]
     if verb not in ARGUMENTS:
         raise MacOSError(f"Unknown operation: {verb!r}", code=ErrorCode.BAD_REQUEST)
@@ -59,23 +91,33 @@ def run(macs: dict[str, MacOS], request: dict[str, object]) -> object:
         app = int(app)
     values = arguments(request["args"], ARGUMENTS[verb])
     agent_id = request["agent_id"]
-    mac = macs.get(agent_id)
+    mac = session.macs.get(agent_id)
     if mac is None:
-        mac = macs[agent_id] = MacOS(agent_id=agent_id)
+        mac = session.macs[agent_id] = MacOS(agent_id=agent_id)
     if verb == "see":
         crop = values.get("crop")
         if crop is not None:
             values["crop"] = tuple(crop)
         return mac.see(app, **values)
     if verb == "state":
-        state = mac.state(app, **values)
-        return {"text": state.text, "complete": state.complete}
+        if app not in session.scriptable:
+            session.scriptable[app] = scriptable(mac.status(app)["app"]["path"])
+        try:
+            state = mac.state(app, **values)
+        except MacOSError as exc:
+            if not session.scriptable[app]:
+                raise
+            raise annotated(exc, SCRIPTABLE) from exc
+        text = f"{state.text}\n{SCRIPTABLE}." if session.scriptable[app] else state.text
+        return {"text": text, "complete": state.complete}
     if verb == "query":
         matches = mac.ax.query(app=app, **values)
         return {"matches": list(matches), "complete": matches.complete, "visited": matches.visited}
     if verb == "handoff":
         handoff = mac.handoff(app=app, **values)
         return {"handoff": handoff.to_json(), "prompt": handoff.to_prompt()}
+    if verb == "script":
+        return {"output": mac.script(**values)}
     state_id = values.pop("state_id", None)
     if state_id is not None:
         state = mac.state(app, window_id=values.get("window_id"))
@@ -95,10 +137,10 @@ def interrupt(_signal: int, _frame: object) -> None:
     raise KeyboardInterrupt
 
 
-def answer(macs: dict[str, MacOS], line: str) -> dict[str, object]:
+def answer(session: Session, line: str) -> dict[str, object]:
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            return {"ok": True, "result": run(macs, json.loads(line))}
+            return {"ok": True, "result": run(session, json.loads(line))}
     except MacOSError as exc:
         return {
             "ok": False,
@@ -112,14 +154,14 @@ def main() -> int:
     process serves one app, so its MacOS instances, imports and pointer
     helper outlive a single call."""
     signal.signal(signal.SIGTERM, interrupt)
-    macs: dict[str, MacOS] = {}
+    session = Session()
     try:
         for line in sys.stdin:
-            print(json.dumps(answer(macs, line), separators=(",", ":")), flush=True)
+            print(json.dumps(answer(session, line), separators=(",", ":")), flush=True)
     except KeyboardInterrupt:
         return 130
     finally:
-        for mac in macs.values():
+        for mac in session.macs.values():
             mac.close()
     return 0
 

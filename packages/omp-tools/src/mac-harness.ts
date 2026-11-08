@@ -8,8 +8,17 @@ import { kv, Text, text } from '@oh-my-pi/pi-tui';
 import type { Theme } from '@oh-my-pi/pi-tui/theme';
 import type { NativeToolView } from '@oh-my-pi/pi-tui/tools/renderer';
 
-type MacVerb = 'see' | 'state' | 'query' | 'handoff' | 'press' | 'click' | 'type' | 'key';
-type ResultKind = 'see' | 'state' | 'query' | 'handoff' | 'receipt' | 'error';
+type MacVerb =
+    | 'see'
+    | 'state'
+    | 'query'
+    | 'handoff'
+    | 'press'
+    | 'click'
+    | 'type'
+    | 'key'
+    | 'script';
+type ResultKind = 'see' | 'state' | 'query' | 'handoff' | 'receipt' | 'script' | 'error';
 type Tone = 'neutral' | 'success' | 'warning' | 'error';
 
 interface MacDetails {
@@ -79,6 +88,7 @@ function subject(verb: MacVerb, args: unknown): string {
         return value === undefined ? '' : `${value.length} characters`;
     }
     if (verb === 'key') return string(values.key) ?? '';
+    if (verb === 'script') return string(values.language) ?? 'AppleScript';
     if (verb === 'see' || verb === 'state')
         return values.window_id === undefined
             ? (string(values.query) ?? '')
@@ -167,8 +177,8 @@ function summarize(result: AgentToolResult<MacDetails>): Summary {
             tone: warnings.length ? 'warning' : 'neutral',
         };
     }
-    if (kind === 'state') {
-        const lines = (string(data.text) ?? '').split('\n');
+    if (kind === 'state' || kind === 'script') {
+        const lines = (string(kind === 'state' ? data.text : data.output) ?? '').split('\n');
         return {
             meta: [data.complete === false ? 'partial read' : `${lines.length} lines`],
             facts: [],
@@ -388,7 +398,7 @@ async function invoke(request: DriverRequest, signal: AbortSignal | undefined): 
     }
     const reply = await driverFor(request.app).request(JSON.stringify(request), signal);
     if ('aborted' in reply || signal?.aborted) {
-        const action = ['press', 'click', 'type', 'key'].includes(request.verb);
+        const action = ['press', 'click', 'type', 'key', 'script'].includes(request.verb);
         throw new Error(
             action
                 ? 'Mac input was interrupted. Whether input was sent is unknown. Run mac_state or mac_see before retrying.'
@@ -419,9 +429,9 @@ async function result(
     const { data } = envelope;
     let kind: ResultKind = 'error';
     if (envelope.ok) {
-        kind = ['see', 'state', 'query', 'handoff'].includes(request.verb)
-            ? (request.verb as ResultKind)
-            : 'receipt';
+        kind = ['press', 'click', 'type', 'key'].includes(request.verb)
+            ? 'receipt'
+            : (request.verb as ResultKind);
     }
     const details: MacDetails = { kind, app: request.app, data };
     if (kind === 'see') {
@@ -442,6 +452,15 @@ async function result(
     }
     if (kind === 'state') {
         return { content: [{ type: 'text', text: string(data.text) ?? '' }], details };
+    }
+    if (kind === 'script') {
+        const output = string(data.output) ?? '';
+        return {
+            content: [
+                { type: 'text', text: output.length ? output : 'The script printed nothing.' },
+            ],
+            details,
+        };
     }
     const summary =
         kind === 'handoff'
@@ -806,6 +825,34 @@ export function registerMacHarness(api: ExtensionAPI): void {
         ) {
             return queued(
                 { verb: 'key', app: targetApp, agent_id: macAgentId(ctx), args, expect: condition },
+                signal,
+            );
+        },
+    });
+
+    api.registerTool({
+        name: 'mac_script',
+        label: 'Run script',
+        description:
+            'Run AppleScript or JavaScript for Automation and return what it printed. For an app mac_state calls scriptable, one script that reads or changes its data usually replaces a series of clicks, and it returns the data itself. Name the app inside the script, as in tell application "Finder"; app orders this call with your other calls for that app. A script still running after timeout seconds (default 15), as when it waits on a dialog or a permission prompt, is stopped.',
+        approval: 'exec',
+        parameters: z.object({
+            app,
+            source: z.string().min(1).describe('The script.'),
+            language: z
+                .enum(['AppleScript', 'JavaScript'])
+                .describe('Default AppleScript.')
+                .optional(),
+            timeout: z
+                .number()
+                .positive()
+                .describe('Seconds before the script is stopped, default 15.')
+                .optional(),
+        }),
+        ...presentation('Run script', 'script'),
+        async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
+            return queued(
+                { verb: 'script', app: targetApp, agent_id: macAgentId(ctx), args },
                 signal,
             );
         },

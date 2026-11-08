@@ -48,7 +48,7 @@ def postcondition(expect: dict[str, object]):
     raise MacOSError(f"Unknown expectation state: {state!r}", code=ErrorCode.BAD_REQUEST)
 
 
-def run(request: dict[str, object]) -> object:
+def run(macs: dict[str, MacOS], request: dict[str, object]) -> object:
     verb = request["verb"]
     if verb not in ARGUMENTS:
         raise MacOSError(f"Unknown operation: {verb!r}", code=ErrorCode.BAD_REQUEST)
@@ -58,33 +58,36 @@ def run(request: dict[str, object]) -> object:
     if app.isascii() and app.isdecimal():
         app = int(app)
     values = arguments(request["args"], ARGUMENTS[verb])
-    with MacOS(agent_id=request["agent_id"]) as mac:
-        if verb == "see":
-            crop = values.get("crop")
-            if crop is not None:
-                values["crop"] = tuple(crop)
-            return mac.see(app, **values)
-        if verb == "state":
-            state = mac.state(app, **values)
-            return {"text": state.text, "complete": state.complete}
-        if verb == "query":
-            matches = mac.ax.query(app=app, **values)
-            return {"matches": list(matches), "complete": matches.complete, "visited": matches.visited}
-        if verb == "handoff":
-            handoff = mac.handoff(app=app, **values)
-            return {"handoff": handoff.to_json(), "prompt": handoff.to_prompt()}
-        state_id = values.pop("state_id", None)
-        if state_id is not None:
-            state = mac.state(app, window_id=values.get("window_id"))
-            try:
-                values["element"] = state[state_id]
-            except KeyError as exc:
-                raise MacOSError(exc.args[0], code=ErrorCode.ELEMENT_UNKNOWN) from None
-        expect = request.get("expect")
-        if expect is not None:
-            values["postcondition"] = postcondition(expect)
-        receipt = getattr(mac.do, verb)(app=app, **values)
-        return {"receipt": receipt.to_json(), "summary": str(receipt)}
+    agent_id = request["agent_id"]
+    mac = macs.get(agent_id)
+    if mac is None:
+        mac = macs[agent_id] = MacOS(agent_id=agent_id)
+    if verb == "see":
+        crop = values.get("crop")
+        if crop is not None:
+            values["crop"] = tuple(crop)
+        return mac.see(app, **values)
+    if verb == "state":
+        state = mac.state(app, **values)
+        return {"text": state.text, "complete": state.complete}
+    if verb == "query":
+        matches = mac.ax.query(app=app, **values)
+        return {"matches": list(matches), "complete": matches.complete, "visited": matches.visited}
+    if verb == "handoff":
+        handoff = mac.handoff(app=app, **values)
+        return {"handoff": handoff.to_json(), "prompt": handoff.to_prompt()}
+    state_id = values.pop("state_id", None)
+    if state_id is not None:
+        state = mac.state(app, window_id=values.get("window_id"))
+        try:
+            values["element"] = state[state_id]
+        except KeyError as exc:
+            raise MacOSError(exc.args[0], code=ErrorCode.ELEMENT_UNKNOWN) from None
+    expect = request.get("expect")
+    if expect is not None:
+        values["postcondition"] = postcondition(expect)
+    receipt = getattr(mac.do, verb)(app=app, **values)
+    return {"receipt": receipt.to_json(), "summary": str(receipt)}
 
 
 def interrupt(_signal: int, _frame: object) -> None:
@@ -92,25 +95,33 @@ def interrupt(_signal: int, _frame: object) -> None:
     raise KeyboardInterrupt
 
 
-def main() -> int:
-    signal.signal(signal.SIGTERM, interrupt)
+def answer(macs: dict[str, MacOS], line: str) -> dict[str, object]:
     try:
-        request = json.loads(sys.argv[1])
         with contextlib.redirect_stdout(sys.stderr):
-            result = run(request)
-        envelope = {"ok": True, "result": result}
-        code = 0
+            return {"ok": True, "result": run(macs, json.loads(line))}
     except MacOSError as exc:
-        envelope = {
+        return {
             "ok": False,
             "error": exc.to_json(),
             "receipt": exc.receipt.to_json() if isinstance(exc, OperationError) else None,
         }
-        code = 1
+
+
+def main() -> int:
+    """Answer one JSON request a line, in order, until stdin closes. One
+    process serves one app, so its MacOS instances, imports and pointer
+    helper outlive a single call."""
+    signal.signal(signal.SIGTERM, interrupt)
+    macs: dict[str, MacOS] = {}
+    try:
+        for line in sys.stdin:
+            print(json.dumps(answer(macs, line), separators=(",", ":")), flush=True)
     except KeyboardInterrupt:
         return 130
-    print(json.dumps(envelope, separators=(",", ":")))
-    return code
+    finally:
+        for mac in macs.values():
+            mac.close()
+    return 0
 
 
 if __name__ == "__main__":

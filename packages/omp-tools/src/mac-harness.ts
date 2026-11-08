@@ -1,3 +1,4 @@
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -275,18 +276,109 @@ function inLane<T>(app: string, run: () => Promise<T>): Promise<T> {
     return next;
 }
 
-async function invoke(
-    api: ExtensionAPI,
-    request: DriverRequest,
-    signal: AbortSignal | undefined,
-): Promise<Envelope> {
+const IDLE_MS = 60_000;
+
+type Reply = { line: string } | { exited: string } | { aborted: true };
+
+// One warm python per app answers that app's calls in order, so a call
+// skips the import, the MacOS setup and the pointer helper's restart.
+class Driver {
+    private readonly child: ChildProcessWithoutNullStreams;
+    private buffer = '';
+    private stderr = '';
+    private waiting?: (reply: Reply) => void;
+    private idle?: NodeJS.Timeout;
+
+    constructor(private readonly forget: () => void) {
+        this.child = spawn(python, [driver], { stdio: 'pipe' });
+        this.child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+            this.buffer += chunk;
+            for (let end = this.buffer.indexOf('\n'); end >= 0; end = this.buffer.indexOf('\n')) {
+                const line = this.buffer.slice(0, end);
+                this.buffer = this.buffer.slice(end + 1);
+                this.settle({ line });
+            }
+        });
+        this.child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+            this.stderr = (this.stderr + chunk).slice(-4000);
+        });
+        this.child.stdin.on('error', () => undefined);
+        this.child.on('error', error => {
+            this.retire();
+            this.settle({ exited: error.message });
+        });
+        this.child.on('close', () => {
+            this.retire();
+            this.settle({ exited: this.stderr.trim() });
+        });
+        this.child.unref();
+    }
+
+    request(line: string, signal: AbortSignal | undefined): Promise<Reply> {
+        clearTimeout(this.idle);
+        const { promise, resolve } = Promise.withResolvers<Reply>();
+        const abort = () => {
+            this.stop();
+            resolve({ aborted: true });
+        };
+        if (signal?.aborted) {
+            abort();
+            return promise;
+        }
+        signal?.addEventListener('abort', abort, { once: true });
+        this.waiting = reply => {
+            signal?.removeEventListener('abort', abort);
+            if ('line' in reply) {
+                this.idle = setTimeout(() => this.stop(), IDLE_MS);
+                this.idle.unref();
+            }
+            resolve(reply);
+        };
+        this.child.stdin.write(`${line}\n`);
+        return promise;
+    }
+
+    private settle(reply: Reply): void {
+        const waiting = this.waiting;
+        this.waiting = undefined;
+        waiting?.(reply);
+    }
+
+    private retire(): void {
+        clearTimeout(this.idle);
+        this.forget();
+    }
+
+    private stop(): void {
+        this.retire();
+        this.waiting = undefined;
+        this.child.kill('SIGTERM');
+        setTimeout(() => this.child.kill('SIGKILL'), 2000).unref();
+    }
+}
+
+const drivers = new Map<string, Driver>();
+
+function driverFor(app: string): Driver {
+    let found = drivers.get(app);
+    if (!found) {
+        const created: Driver = new Driver(() => {
+            if (drivers.get(app) === created) drivers.delete(app);
+        });
+        found = created;
+        drivers.set(app, created);
+    }
+    return found;
+}
+
+async function invoke(request: DriverRequest, signal: AbortSignal | undefined): Promise<Envelope> {
     if (request.expect?.state === 'equals' && request.expect.value === undefined) {
         throw new Error('An equals expectation requires value.');
     }
-    const execution = await inLane(request.app, () =>
-        api.exec(python, [driver, JSON.stringify(request)], { signal }),
+    const reply = await inLane(request.app, () =>
+        driverFor(request.app).request(JSON.stringify(request), signal),
     );
-    if (execution.killed || signal?.aborted) {
+    if ('aborted' in reply || signal?.aborted) {
         const action = ['press', 'click', 'type', 'key'].includes(request.verb);
         throw new Error(
             action
@@ -294,31 +386,27 @@ async function invoke(
                 : 'Mac observation was interrupted.',
         );
     }
+    if ('exited' in reply) throw new Error(`Mac harness exited without a result. ${reply.exited}`);
     let parsed: unknown;
     try {
-        parsed = JSON.parse(execution.stdout);
+        parsed = JSON.parse(reply.line);
     } catch {
-        throw new Error(
-            `Mac harness exited ${execution.code} without a valid result. ${execution.stderr.trim() || execution.stdout.trim()}`,
-        );
+        throw new Error(`Mac harness answered without a valid result. ${reply.line}`);
     }
     const envelope = object(parsed);
     if (envelope?.ok === false && object(envelope.error)) return { ok: false, data: envelope };
     const data = object(envelope?.result);
-    if (execution.code !== 0 || envelope?.ok !== true || !data) {
-        throw new Error(
-            `Mac harness exited ${execution.code} without a successful result. ${execution.stderr.trim() || execution.stdout.trim()}`,
-        );
+    if (envelope?.ok !== true || !data) {
+        throw new Error(`Mac harness answered without a successful result. ${reply.line}`);
     }
     return { ok: true, data };
 }
 
 async function result(
-    api: ExtensionAPI,
     request: DriverRequest,
     signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<MacDetails>> {
-    const envelope = await invoke(api, request, signal);
+    const envelope = await invoke(request, signal);
     const { data } = envelope;
     let kind: ResultKind = 'error';
     if (envelope.ok) {
@@ -434,7 +522,6 @@ export function registerMacHarness(api: ExtensionAPI): void {
         ...presentation('See app', 'see'),
         async execute(_toolCallId, { app: targetApp, crop, ...args }, signal, _onUpdate, ctx) {
             return result(
-                api,
                 {
                     verb: 'see',
                     app: targetApp,
@@ -471,7 +558,6 @@ export function registerMacHarness(api: ExtensionAPI): void {
         ...presentation('Read app', 'state'),
         async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
             return result(
-                api,
                 { verb: 'state', app: targetApp, agent_id: macAgentId(ctx), args },
                 signal,
             );
@@ -493,7 +579,6 @@ export function registerMacHarness(api: ExtensionAPI): void {
         ...presentation('Find controls', 'query'),
         async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
             return result(
-                api,
                 { verb: 'query', app: targetApp, agent_id: macAgentId(ctx), args },
                 signal,
             );
@@ -516,7 +601,6 @@ export function registerMacHarness(api: ExtensionAPI): void {
             ctx,
         ) {
             return result(
-                api,
                 {
                     verb: 'press',
                     app: targetApp,
@@ -578,7 +662,6 @@ export function registerMacHarness(api: ExtensionAPI): void {
                 );
             }
             return result(
-                api,
                 {
                     verb: 'click',
                     app: targetApp,
@@ -613,7 +696,6 @@ export function registerMacHarness(api: ExtensionAPI): void {
             ctx,
         ) {
             return result(
-                api,
                 {
                     verb: 'type',
                     app: targetApp,
@@ -642,7 +724,6 @@ export function registerMacHarness(api: ExtensionAPI): void {
             ctx,
         ) {
             return result(
-                api,
                 { verb: 'key', app: targetApp, agent_id: macAgentId(ctx), args, expect: condition },
                 signal,
             );
@@ -662,7 +743,6 @@ export function registerMacHarness(api: ExtensionAPI): void {
         ...presentation('Ask for sign-in', 'handoff'),
         async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
             return result(
-                api,
                 { verb: 'handoff', app: targetApp, agent_id: macAgentId(ctx), args },
                 signal,
             );

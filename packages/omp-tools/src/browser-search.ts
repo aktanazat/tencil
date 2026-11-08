@@ -14,19 +14,52 @@ const PAGE_SIZE = 10;
 const RECENCY_DAYS = { day: 1, week: 7, month: 30, year: 365 };
 
 type Invoke = (tool: string, args: Record<string, unknown>) => Promise<unknown>;
-type GoogleResult = { title: string; url: string; snippet: string };
+type Result = { title: string; url: string; snippet: string };
+type PageHit = { url: string; title: string; readAt: number; excerpt: string };
+type Engine = 'google' | 'bing' | 'stored';
+type Found = { engine: Engine; results: Result[]; notes: string[]; read: PageHit[] };
 type RpcModule = {
     rpc: Invoke;
     ownCalls(pid: number): void;
     withTask<T>(task: string, run: () => Promise<T>): Promise<T>;
     quietly<T>(run: () => Promise<T>): Promise<T>;
 };
-type KitModule = { SiteKit: new (send: Invoke) => object };
+type Kit = { close(): Promise<unknown> };
+type KitModule = { SiteKit: new (send: Invoke) => Kit };
 type SearchModule = {
-    googleSearch(kit: object): {
+    webSearch(kit: Kit): {
         search(query: string, options: { limit: number }): Promise<unknown>;
     };
 };
+type Pooled = { kit: Kit; signal?: AbortSignal };
+
+// A search keeps its Google and Bing tabs for the task's next one: opening
+// a tab took 1.2 s of a 1.8 s search (11-08). Searches that run at once
+// each take their own kit, since two in one tab would load over each other.
+const IDLE_KITS = 4;
+const TASKS_KEPT = 32;
+const idleKits = new Map<string, Pooled[]>();
+
+function takeKit(task: string, make: () => Pooled): Pooled {
+    const idle = idleKits.get(task);
+    const pooled = idle?.pop();
+    if (idle?.length === 0) idleKits.delete(task);
+    return pooled ?? make();
+}
+
+function giveBack(task: string, pooled: Pooled): void {
+    pooled.signal = undefined;
+    const idle = idleKits.get(task) ?? [];
+    idleKits.delete(task);
+    idleKits.set(task, idle);
+    if (idle.length < IDLE_KITS) idle.push(pooled);
+    else void pooled.kit.close().catch(() => undefined);
+    for (const [oldest, kits] of idleKits) {
+        if (idleKits.size <= TASKS_KEPT) break;
+        idleKits.delete(oldest);
+        for (const k of kits) void k.kit.close().catch(() => undefined);
+    }
+}
 
 const leadOfAgent = new Map<string, string>();
 const leadOfHelper = new Map<string, string>();
@@ -61,7 +94,7 @@ function kitModule(value: unknown): value is KitModule {
 }
 
 function searchModule(value: unknown): value is SearchModule {
-    return record(value) && typeof value.googleSearch === 'function';
+    return record(value) && typeof value.webSearch === 'function';
 }
 
 async function loadSafari() {
@@ -69,7 +102,7 @@ async function loadSafari() {
     const [rpc, kit, search]: unknown[] = await Promise.all([
         import(pathToFileURL(join(root, 'rpc.ts')).href),
         import(pathToFileURL(join(root, 'sites/kit.ts')).href),
-        import(pathToFileURL(join(root, 'sites/google-search.ts')).href),
+        import(pathToFileURL(join(root, 'sites/web-search.ts')).href),
     ]);
     if (!rpcModule(rpc) || !kitModule(kit) || !searchModule(search)) {
         throw new Error('The installed Safari helper does not expose the browser search client.');
@@ -77,7 +110,7 @@ async function loadSafari() {
     return { rpc, kit, search };
 }
 
-function googleResult(value: unknown): value is GoogleResult {
+function searchResult(value: unknown): value is Result {
     return (
         record(value) &&
         typeof value.title === 'string' &&
@@ -86,11 +119,30 @@ function googleResult(value: unknown): value is GoogleResult {
     );
 }
 
-function readResults(value: unknown): GoogleResult[] {
-    if (!record(value) || !Array.isArray(value.results) || !value.results.every(googleResult)) {
-        throw new Error('Safari returned an unrecognized Google search response.');
+function pageHit(value: unknown): value is PageHit {
+    return (
+        record(value) &&
+        typeof value.url === 'string' &&
+        typeof value.title === 'string' &&
+        typeof value.readAt === 'number' &&
+        typeof value.excerpt === 'string'
+    );
+}
+
+function readFound(value: unknown): Found {
+    if (
+        !record(value) ||
+        (value.engine !== 'google' && value.engine !== 'bing' && value.engine !== 'stored') ||
+        !Array.isArray(value.results) ||
+        !value.results.every(searchResult) ||
+        !Array.isArray(value.notes) ||
+        !value.notes.every(note => typeof note === 'string') ||
+        !Array.isArray(value.read) ||
+        !value.read.every(pageHit)
+    ) {
+        throw new Error('Safari returned an unrecognized web search response.');
     }
-    return value.results;
+    return { engine: value.engine, results: value.results, notes: value.notes, read: value.read };
 }
 
 function cleanUrl(raw: string): string | undefined {
@@ -115,7 +167,7 @@ function cleanUrl(raw: string): string | undefined {
     return url.href;
 }
 
-function sourcesOf(results: GoogleResult[]): SearchSource[] {
+function sourcesOf(results: Result[]): SearchSource[] {
     const seen = new Set<string>();
     const sources: SearchSource[] = [];
     for (const result of results) {
@@ -127,7 +179,13 @@ function sourcesOf(results: GoogleResult[]): SearchSource[] {
     return sources;
 }
 
-function formatResults(sources: SearchSource[], notes: string[]): string {
+const ENGINE_NAMES: Record<Engine, string> = {
+    google: 'Google',
+    bing: 'Bing',
+    stored: 'the local page store',
+};
+
+function formatResults(sources: SearchSource[], notes: string[], read: PageHit[]): string {
     const parts = notes.map(note => `Note: ${note}`);
     for (const [index, source] of sources.entries()) {
         parts.push(`[${index + 1}] ${source.title}\n    ${source.url}`);
@@ -136,6 +194,13 @@ function formatResults(sources: SearchSource[], notes: string[]): string {
                 source.snippet.length > 240 ? `${source.snippet.slice(0, 239)}…` : source.snippet;
             parts.push(`    ${snippet}`);
         }
+    }
+    if (read.length) parts.push('Already read by an agent (local copy, no browser needed):');
+    for (const page of read) {
+        const day = new Date(page.readAt).toISOString().slice(0, 10);
+        parts.push(
+            `- ${page.title || page.url} (read ${day})\n    ${page.url}\n    ${page.excerpt}`,
+        );
     }
     return parts.join('\n');
 }
@@ -165,7 +230,72 @@ async function abortable<T>(work: Promise<T>, signal: AbortSignal | undefined): 
     }
 }
 
+function responseOf(engine: Engine, sources: SearchSource[]): SearchRenderDetails['response'] {
+    if (engine === 'google') return { provider: 'google', authMode: 'Safari', sources };
+    return {
+        provider: 'public',
+        authMode: engine === 'bing' ? 'Safari (Bing)' : 'local page store',
+        sources,
+    };
+}
+
+// A read of a web page, kept so a later search finds it without a browser.
+// A ranged or raw read is part of a page, and a result the Safari helper
+// appended to (walls.ts: lines starting "safari:") holds what his signed-in
+// Safari saw. The store refuses addresses that are not public.
+const SELECTOR = /:(?:raw|img|conflicts|-?\d[\d,+-]*)(?::raw)?$/;
+const READ_MIN = 500;
+const READS_KEPT = 200;
+
+function webUrl(path: unknown): string | undefined {
+    return typeof path === 'string' && /^https?:\/\//i.test(path) && !SELECTOR.test(path)
+        ? path
+        : undefined;
+}
+
+function textOf(result: unknown): string | undefined {
+    const content = record(result) ? result.content : undefined;
+    if (!Array.isArray(content)) return undefined;
+    const text = content
+        .flatMap(block =>
+            record(block) && block.type === 'text' && typeof block.text === 'string'
+                ? [block.text]
+                : [],
+        )
+        .join('\n');
+    return text.length < READ_MIN || /^safari: /m.test(text) ? undefined : text;
+}
+
+function captureReads(api: ExtensionAPI): void {
+    const asked = new Map<string, string>();
+    api.on('tool_execution_start', event => {
+        if (event.toolName !== 'read' || !record(event.args)) return;
+        const url = webUrl(event.args.path);
+        if (url === undefined) return;
+        asked.set(event.toolCallId, url);
+        for (const id of asked.keys()) {
+            if (asked.size <= READS_KEPT) break;
+            asked.delete(id);
+        }
+    });
+    api.on('tool_execution_end', event => {
+        const url = asked.get(event.toolCallId);
+        asked.delete(event.toolCallId);
+        const text = url === undefined || event.isError ? undefined : textOf(event.result);
+        if (url === undefined || text === undefined) return;
+        const title = /^#\s+(.+)$/m.exec(text)?.[1]?.trim().slice(0, 300) ?? '';
+        void loadSafari()
+            .then(client =>
+                client.rpc.quietly(() =>
+                    client.rpc.rpc('pages', { do: 'put', url, title, text, source: 'read' }),
+                ),
+            )
+            .catch(() => undefined);
+    });
+}
+
 export function registerBrowserSearch(api: ExtensionAPI): void {
+    captureReads(api);
     const parameters = api.arktype({
         query: 'string',
         recency: "'day' | 'week' | 'month' | 'year'?",
@@ -182,7 +312,7 @@ export function registerBrowserSearch(api: ExtensionAPI): void {
         name: 'web_search',
         label: 'Web Search',
         description:
-            "Search Google in the owner's real Safari session. Known URLs → read. Supports site:, -site:, after: and before: YYYY-MM-DD, inurl:, intitle:, filetype:, quoted phrases, -term and OR. Prefer primary sources and cite their links. Recency adds an after: date unless one is explicit. Returns one page of up to 10 organic results; limit and num_search_results are result counts (num_search_results takes precedence). No paid provider or fallback.",
+            "Search Google in the owner's real Safari session; Bing answers when Google is busy or shows a bot check, and a repeat of a search in the last 10 minutes comes from the local store. Also lists matching pages agents already read, with an excerpt. Known URLs → read. Supports site:, -site:, after: and before: YYYY-MM-DD, inurl:, intitle:, filetype:, quoted phrases, -term and OR. Prefer primary sources and cite their links. Recency adds an after: date unless one is explicit. Returns one page of up to 10 results; limit and num_search_results are result counts (num_search_results takes precedence). No paid provider.",
         parameters,
         approval: 'read',
         strict: true,
@@ -210,7 +340,7 @@ export function registerBrowserSearch(api: ExtensionAPI): void {
                 const limit = Math.min(PAGE_SIZE, Math.floor(requested));
                 const notes: string[] = [];
                 if (requested > PAGE_SIZE)
-                    notes.push('Google search returns one page of up to 10 organic results.');
+                    notes.push('Web search returns one page of up to 10 results.');
                 let effectiveQuery = query;
                 if (params.recency && !/(?:^|\s)after:\d{4}-\d{2}-\d{2}\b/i.test(query)) {
                     const after = new Date(Date.now() - RECENCY_DAYS[params.recency] * 86_400_000)
@@ -223,26 +353,43 @@ export function registerBrowserSearch(api: ExtensionAPI): void {
                 if (signal?.aborted) throw cancelled();
                 client.rpc.ownCalls(process.pid);
                 const task = safariTask(ctx);
-                const run = client.rpc.withTask(task, () =>
-                    client.rpc.quietly(async () => {
-                        const kit = new client.kit.SiteKit(async (name, args) => {
-                            if (signal?.aborted) throw cancelled();
+                const pooled = takeKit(task, () => {
+                    const made: Pooled = {
+                        kit: new client.kit.SiteKit(async (name, args) => {
+                            if (made.signal?.aborted) throw cancelled();
                             return client.rpc.rpc(name, args);
-                        });
-                        return client.search.googleSearch(kit).search(effectiveQuery, { limit });
-                    }),
+                        }),
+                    };
+                    return made;
+                });
+                pooled.signal = signal;
+                const run = client.rpc.withTask(task, () =>
+                    client.rpc.quietly(() =>
+                        client.search.webSearch(pooled.kit).search(effectiveQuery, { limit }),
+                    ),
                 );
-                const page = await abortable(run, signal);
-                if (signal?.aborted) throw cancelled();
-                const sources = sourcesOf(readResults(page));
-                if (sources.length === 0) {
-                    throw new Error(
-                        'Google returned no readable organic results. This can mean no matches, a consent or check page, or changed result markup. No alternate provider was used.',
+                let found: Found;
+                try {
+                    found = readFound(await abortable(run, signal));
+                } finally {
+                    run.then(
+                        () => giveBack(task, pooled),
+                        () => void pooled.kit.close().catch(() => undefined),
                     );
                 }
+                if (signal?.aborted) throw cancelled();
+                const sources = sourcesOf(found.results);
+                if (sources.length === 0 && found.read.length === 0) {
+                    throw new Error(
+                        `${ENGINE_NAMES[found.engine]} returned no readable results. This can mean no matches, a consent or check page, or changed result markup.`,
+                    );
+                }
+                notes.push(...found.notes);
+                if (found.engine !== 'google')
+                    notes.push(`These results came from ${ENGINE_NAMES[found.engine]}.`);
                 return {
-                    content: [{ type: 'text', text: formatResults(sources, notes) }],
-                    details: { response: { provider: 'google', authMode: 'Safari', sources } },
+                    content: [{ type: 'text', text: formatResults(sources, notes, found.read) }],
+                    details: { response: responseOf(found.engine, sources) },
                 };
             } catch (error) {
                 if (signal?.aborted) throw cancelled();
@@ -251,7 +398,7 @@ export function registerBrowserSearch(api: ExtensionAPI): void {
                     isError: true,
                     content: [{ type: 'text', text: `Error: ${message}` }],
                     details: {
-                        response: { provider: 'google', authMode: 'Safari', sources: [] },
+                        response: responseOf('google', []),
                         error: message,
                     },
                 };

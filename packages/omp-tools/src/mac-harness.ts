@@ -84,8 +84,8 @@ function subject(verb: MacVerb, args: unknown): string {
             ? (string(values.query) ?? '')
             : `window ${display(values.window_id)}`;
     if (verb === 'handoff') return string(values.reason)?.replaceAll('_', ' ') ?? '';
+    if (typeof values.state_id === 'number') return `[${values.state_id}]`;
     if (verb === 'click') {
-        if (typeof values.state_id === 'number') return `[${values.state_id}]`;
         const element = object(values.element);
         return element
             ? [element.role, element.title, element.description]
@@ -540,7 +540,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
         name: 'mac_state',
         label: 'Read app',
         description:
-            'Read one native Mac app window as compact text, one control per line like [12] button "Save", without activating it. Prefer this to mac_see: it costs a fraction of a screenshot, and later reads print only what changed since your last one. Pass an id to mac_click as state_id. Use query to print only lines mentioning a word, from the whole window. Calls for one app run in the order you issue them, so one turn can hold several actions and end with mac_state. Take mac_see only when the text lacks what you need (images, layout, canvas apps). Use Safari tools for web pages.',
+            'Read one native Mac app window as compact text, one control per line like [12] button "Save", without activating it. Prefer this to mac_see: it costs a fraction of a screenshot, and later reads print only what changed since your last one. Act on a line by passing its id as state_id to mac_press, or to mac_click for controls without a press. Use query to print only lines mentioning a word, from the whole window. Calls for one app run in the order you issue them, so one turn can hold several actions and end with mac_state. Take mac_see only when the text lacks what you need (images, layout, canvas apps). Use Safari tools for web pages.',
         approval: 'read',
         parameters: z.object({
             app,
@@ -588,10 +588,21 @@ export function registerMacHarness(api: ExtensionAPI): void {
     api.registerTool({
         name: 'mac_press',
         label: 'Press control',
-        description: `Press one uniquely matched native Accessibility control. ${actionNote}`,
+        description: `Press a control by its mac_state id (state_id), or one control uniquely matched by selectors. Prefer state_id: it skips the search and works in background windows, while a name mac_state prints may be a title or a description. ${actionNote}`,
         approval: 'write',
         approvalCacheTargets: approvalTargets,
-        parameters: z.object({ app, ...selectors, timeout, expect }),
+        parameters: z.object({
+            app,
+            ...selectors,
+            state_id: z
+                .number()
+                .int()
+                .nonnegative()
+                .describe('An id from the last mac_state of this app; use no selector with it.')
+                .optional(),
+            timeout,
+            expect,
+        }),
         ...presentation('Press control', 'press'),
         async execute(
             _toolCallId,

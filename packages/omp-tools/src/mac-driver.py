@@ -14,7 +14,7 @@ ARGUMENTS = {
     "state": {"query", "window_id", "diff"},
     "query": SELECTORS | {"limit", "visible_only"},
     "handoff": {"reason"},
-    "press": SELECTORS | {"timeout"},
+    "press": SELECTORS | {"state_id", "timeout"},
     "click": {"x", "y", "element", "state_id", "window_id", "screenshot", "button", "clicks", "timeout"},
     "type": {"text", "window_id", "timeout"},
     "key": {"key", "window_id", "timeout"},

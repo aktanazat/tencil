@@ -42,8 +42,20 @@ ARGUMENTS = {
     "paste": {"text", "html", "rtf", "tsv", "files", "window_id", "timeout"},
     "open_files": {"files", "timeout"},
     "steps": {"steps"},
+    "shortcut": {"name", "input", "output", "output_type", "timeout"},
 }
+DATA = {
+    "find_files": {"query", "name", "kind", "content", "onlyin", "limit", "timeout"},
+    "file_info": {"path"},
+    "shortcuts": set(),
+    "read_defaults": {"domain", "key", "current_host"},
+    "query_sqlite": {"path", "sql", "params", "immutable"},
+    "wait_file": {"path", "contains", "since", "timeout"},
+}
+ARGUMENTS["data"] = {"action"}.union(*DATA.values())
 INPUT = {"press", "click", "type", "key", "script", "menu", "paste", "open_files"}
+# Calls a recording cannot hold as one step.
+UNRECORDED = {"steps", "shortcut"}
 STEP_OPS = {"press", "click", "type", "key", "menu", "paste", "open_files", "expect"}
 SCRIPTABLE = "This app is scriptable: prefer one mac_script to a series of clicks"
 # A recording spans the agent's turns, and the harness gives it one deadline.
@@ -198,6 +210,18 @@ def steps(mac: MacOS, app: str | int, values: dict[str, object]) -> dict[str, ob
     return {"steps": result.to_json(), "summary": str(result)}
 
 
+def plain(value: object) -> object:
+    # Plist dates and bytes and SQLite blobs reach JSON as text.
+    return json.loads(json.dumps(value, default=str))
+
+
+def data(mac: MacOS, values: dict[str, object]) -> dict[str, object]:
+    action = values.pop("action", None)
+    if action not in DATA:
+        raise MacOSError(f"action is one of {', '.join(DATA)}", code=ErrorCode.BAD_REQUEST)
+    return {"data": plain(getattr(mac.data, action)(**arguments(values, DATA[action])))}
+
+
 def locator(mac: MacOS, app: str | int, values: dict[str, object]) -> dict[str, str]:
     state_id = values.pop("state_id", None)
     if state_id is not None:
@@ -331,9 +355,9 @@ def run(session: Session, request: dict[str, object]) -> object:
         mac = session.macs[agent_id] = MacOS(agent_id=agent_id)
     if verb == "route":
         return route(session, mac, agent_id, app, values)
-    if verb == "steps" and agent_id in session.recordings:
+    if verb in UNRECORDED and agent_id in session.recordings:
         raise MacOSError(
-            "A recording takes one press or key per call; send the steps one at a time or close the recording",
+            f"A recording takes one press or key per call; close the recording before {verb}",
             code=ErrorCode.BAD_REQUEST,
         )
     if agent_id in session.recordings and verb in INPUT:
@@ -368,6 +392,10 @@ def run(session: Session, request: dict[str, object]) -> object:
         return {"matches": mac.menu_search(app=app, **values)}
     if verb == "steps":
         return steps(mac, app, values)
+    if verb == "data":
+        return data(mac, values)
+    if verb == "shortcut":
+        return {"data": plain(mac.data.run_shortcut(**values))}
     if verb == "menu":
         verb = "menu_search"
     targeted(mac, app, verb, values, {})

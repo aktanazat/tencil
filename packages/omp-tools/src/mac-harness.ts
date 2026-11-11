@@ -24,7 +24,9 @@ type MacVerb =
     | 'sdef'
     | 'paste'
     | 'open_files'
-    | 'steps';
+    | 'steps'
+    | 'data'
+    | 'shortcut';
 type ResultKind =
     | 'see'
     | 'state'
@@ -36,6 +38,8 @@ type ResultKind =
     | 'menus'
     | 'sdef'
     | 'steps'
+    | 'data'
+    | 'shortcut'
     | 'error';
 type Tone = 'neutral' | 'success' | 'warning' | 'error';
 
@@ -70,6 +74,8 @@ const driver = fileURLToPath(new URL('./mac-driver.py', import.meta.url));
 const python = join(homedir(), '.local/share/uv/tools/macos-harness/bin/python');
 const actionNote =
     'Does not activate the app or move the physical pointer. Never retry an action whose receipt says acted=yes or unknown before checking mac_state, mac_see or mac_query.';
+// Data reads and shortcuts belong to no app; they share one driver lane.
+const DATA_LANE = 'mac data';
 const RECEIPT_VERBS: readonly MacVerb[] = [
     'press',
     'click',
@@ -125,6 +131,8 @@ function subject(verb: MacVerb, args: unknown): string {
     }
     if (verb === 'script') return string(values.language) ?? 'AppleScript';
     if (verb === 'steps') return Array.isArray(values.steps) ? `${values.steps.length} steps` : '';
+    if (verb === 'data') return string(values.action) ?? '';
+    if (verb === 'shortcut') return string(values.name) ?? '';
     if (verb === 'route')
         return [values.action, values.name].filter(value => typeof value === 'string').join(' ');
     if (verb === 'see' || verb === 'state')
@@ -344,6 +352,14 @@ function summarize(result: AgentToolResult<MacDetails>): Summary {
             tone: stopped ? 'error' : 'success',
         };
     }
+    if (kind === 'data' || kind === 'shortcut') {
+        const found = data.data;
+        return {
+            meta: Array.isArray(found) ? [`${found.length} items`] : [],
+            facts: [],
+            tone: 'neutral',
+        };
+    }
     if (kind === 'route') {
         const run = object(data.run);
         return {
@@ -558,7 +574,9 @@ async function invoke(request: DriverRequest, signal: AbortSignal | undefined): 
     }
     const reply = await driverFor(request.app).request(JSON.stringify(request), signal);
     if ('aborted' in reply || signal?.aborted) {
-        const action = ['script', 'route', 'steps', ...RECEIPT_VERBS].includes(request.verb);
+        const action = ['script', 'route', 'steps', 'shortcut', ...RECEIPT_VERBS].includes(
+            request.verb,
+        );
         throw new Error(
             action
                 ? 'Mac input was interrupted. Whether input was sent is unknown. Run mac_state or mac_see before retrying.'
@@ -618,6 +636,9 @@ async function result(
     }
     if (kind === 'menus' || kind === 'sdef') {
         return { content: [{ type: 'text', text: JSON.stringify(data) }], details };
+    }
+    if (kind === 'data' || kind === 'shortcut') {
+        return { content: [{ type: 'text', text: JSON.stringify(data.data) }], details };
     }
     if (kind === 'steps') {
         return {
@@ -1308,6 +1329,97 @@ export function registerMacHarness(api: ExtensionAPI): void {
         async execute(_toolCallId, { app: targetApp, steps }, signal, _onUpdate, ctx) {
             return queued(
                 { verb: 'steps', app: targetApp, agent_id: macAgentId(ctx), args: { steps } },
+                signal,
+            );
+        },
+    });
+
+    const path = z.string().min(1).describe('A file path; ~ is expanded.');
+    const query = z.union([
+        z.object({
+            action: z.literal('find_files'),
+            query: z.string().describe('Raw Spotlight query syntax.').optional(),
+            name: z.string().describe('Part of the file name.').optional(),
+            kind: z.string().describe('A content type, such as com.adobe.pdf.').optional(),
+            content: z.string().describe('Text inside the file.').optional(),
+            onlyin: z.array(z.string().min(1)).describe('Folders to search.').optional(),
+            limit: z.number().int().positive().describe('Default 1000.').optional(),
+            timeout: z.number().positive().describe('Seconds, default 10.').optional(),
+        }),
+        z.object({ action: z.literal('file_info'), path }),
+        z.object({ action: z.literal('shortcuts') }),
+        z.object({
+            action: z.literal('read_defaults'),
+            domain: z.string().min(1).describe('A bundle id or domain; -g is the global one.'),
+            key: z.string().optional(),
+            current_host: z.boolean().optional(),
+        }),
+        z.object({
+            action: z.literal('query_sqlite'),
+            path,
+            sql: z.string().min(1).describe('One read statement; writes are refused.'),
+            params: z.array(z.union([z.string(), z.number(), z.boolean()])).optional(),
+            immutable: z
+                .boolean()
+                .describe('Read a store no app has open without its lock.')
+                .optional(),
+        }),
+        z.object({
+            action: z.literal('wait_file'),
+            path,
+            contains: z.string().describe('Text the file must hold.').optional(),
+            since: z.number().describe('Epoch seconds the file must be written after.').optional(),
+            timeout: z.number().positive().describe('Seconds, default 10.').optional(),
+        }),
+    ]);
+
+    api.registerTool({
+        name: 'mac_data',
+        label: 'Read Mac data',
+        description:
+            "Read Mac data straight from the system instead of an app's window: find_files searches Spotlight; file_info gives a file's kind, where it was downloaded from, and dates; shortcuts lists the user's Shortcuts; read_defaults reads an app's settings; query_sqlite runs one read on an app's database; wait_file waits until a save really reached disk. Reads only, and touches no app. A sandboxed app's settings fail as unsupported_op: read them from its window.",
+        approval: 'read',
+        parameters: z.object({ request: query }),
+        ...presentation('Read Mac data', 'data'),
+        async execute(_toolCallId, { request }, signal, _onUpdate, ctx) {
+            return queued(
+                {
+                    verb: 'data',
+                    app: DATA_LANE,
+                    agent_id: macAgentId(ctx),
+                    args: object(request) ?? {},
+                },
+                signal,
+            );
+        },
+    });
+
+    api.registerTool({
+        name: 'mac_shortcut',
+        label: 'Run shortcut',
+        description:
+            "Run one of the user's Shortcuts by name with no Shortcuts window, optionally on input files, and return what it wrote. A shortcut can act on any app or send messages: run only one the user named or mac_data shortcuts listed for this task.",
+        approval: 'exec',
+        parameters: z.object({
+            name: z.string().min(1),
+            input: z.array(z.string().min(1)).describe('Input file paths.').optional(),
+            output: z
+                .string()
+                .min(1)
+                .describe('Where its result goes; else it comes back as stdout.')
+                .optional(),
+            output_type: z.string().describe('A content type for the output.').optional(),
+            timeout: z.number().positive().describe('Seconds, default 60.').optional(),
+        }),
+        ...presentation('Run shortcut', 'shortcut'),
+        async execute(_toolCallId, { name, ...rest }, signal, _onUpdate, ctx) {
+            return queued(
+                {
+                    verb: 'shortcut',
+                    app: DATA_LANE,
+                    agent_id: macAgentId(ctx),
+                    args: { name, ...rest },
+                },
                 signal,
             );
         },

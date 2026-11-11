@@ -23,7 +23,8 @@ type MacVerb =
     | 'menu'
     | 'sdef'
     | 'paste'
-    | 'open_files';
+    | 'open_files'
+    | 'steps';
 type ResultKind =
     | 'see'
     | 'state'
@@ -34,6 +35,7 @@ type ResultKind =
     | 'route'
     | 'menus'
     | 'sdef'
+    | 'steps'
     | 'error';
 type Tone = 'neutral' | 'success' | 'warning' | 'error';
 
@@ -122,6 +124,7 @@ function subject(verb: MacVerb, args: unknown): string {
         return files ? `${files} files` : 'rich text';
     }
     if (verb === 'script') return string(values.language) ?? 'AppleScript';
+    if (verb === 'steps') return Array.isArray(values.steps) ? `${values.steps.length} steps` : '';
     if (verb === 'route')
         return [values.action, values.name].filter(value => typeof value === 'string').join(' ');
     if (verb === 'see' || verb === 'state')
@@ -325,6 +328,20 @@ function summarize(result: AgentToolResult<MacDetails>): Summary {
             meta: [`${count('commands')} commands`, `${count('classes')} classes`],
             facts: [],
             tone: 'neutral',
+        };
+    }
+    if (kind === 'steps') {
+        const run = object(data.steps);
+        const stopped = run?.status !== 'done';
+        return {
+            meta: [
+                stopped
+                    ? `stopped at step ${display(run?.stopped_at)}`
+                    : `${display(run?.steps)} steps`,
+            ],
+            facts: [],
+            message: string(data.summary),
+            tone: stopped ? 'error' : 'success',
         };
     }
     if (kind === 'route') {
@@ -541,7 +558,7 @@ async function invoke(request: DriverRequest, signal: AbortSignal | undefined): 
     }
     const reply = await driverFor(request.app).request(JSON.stringify(request), signal);
     if ('aborted' in reply || signal?.aborted) {
-        const action = ['script', 'route', ...RECEIPT_VERBS].includes(request.verb);
+        const action = ['script', 'route', 'steps', ...RECEIPT_VERBS].includes(request.verb);
         throw new Error(
             action
                 ? 'Mac input was interrupted. Whether input was sent is unknown. Run mac_state or mac_see before retrying.'
@@ -602,6 +619,13 @@ async function result(
     if (kind === 'menus' || kind === 'sdef') {
         return { content: [{ type: 'text', text: JSON.stringify(data) }], details };
     }
+    if (kind === 'steps') {
+        return {
+            content: [{ type: 'text', text: string(data.summary) ?? JSON.stringify(data) }],
+            details,
+            isError: object(data.steps)?.status !== 'done',
+        };
+    }
     if (kind === 'route') {
         const run = object(data.run);
         const stopped = run !== undefined && run.status !== 'done' && run.status !== 'already';
@@ -651,7 +675,10 @@ function failure(result: AgentToolResult<MacDetails>): string | undefined {
     const data = result.details?.data ?? {};
     const receipt = object(data.receipt);
     if (!result.isError && receipt?.outcome !== 'failed') return undefined;
-    return string(object(data.error ?? object(data.run)?.error)?.code) ?? 'error';
+    return (
+        string(object(data.error ?? object(data.run)?.error ?? object(data.steps)?.error)?.code) ??
+        'error'
+    );
 }
 
 function notRun(request: DriverRequest, batch: Batch): AgentToolResult<MacDetails> {
@@ -1204,6 +1231,83 @@ export function registerMacHarness(api: ExtensionAPI): void {
                     args,
                     expect: condition,
                 },
+                signal,
+            );
+        },
+    });
+
+    const stateId = z
+        .number()
+        .int()
+        .nonnegative()
+        .describe("An id from the last mac_state of this app's window, read before this call.")
+        .optional();
+    const step = z.union([
+        z.object({
+            op: z.literal('press'),
+            ...selectors,
+            state_id: stateId,
+            window_id: windowId,
+            timeout,
+            expect,
+        }),
+        z.object({
+            op: z.literal('click'),
+            x: z.number().optional(),
+            y: z.number().optional(),
+            screenshot: z.string().min(1).optional(),
+            element: z.record(z.unknown()).optional(),
+            state_id: stateId,
+            window_id: windowId,
+            button: z.enum(['left', 'right', 'middle']).optional(),
+            clicks: z.number().int().min(1).max(3).optional(),
+            timeout,
+            expect,
+        }),
+        z.object({
+            op: z.literal('type'),
+            text: z.string().max(4096),
+            window_id: windowId,
+            timeout,
+            expect,
+        }),
+        z.object({
+            op: z.literal('key'),
+            key: z.string().min(1),
+            window_id: windowId,
+            timeout,
+            expect,
+        }),
+        z.object({ op: z.literal('menu'), text: z.string().min(1), timeout, expect }),
+        z.object({
+            op: z.literal('paste'),
+            text: z.string().optional(),
+            html: z.string().optional(),
+            rtf: z.string().optional(),
+            tsv: z.string().optional(),
+            files: files.optional(),
+            window_id: windowId,
+            timeout,
+            expect,
+        }),
+        z.object({ op: z.literal('open_files'), files, timeout, expect }),
+        z.object({
+            op: z.literal('expect'),
+            expect: condition.describe('Wait until this holds before the next step.'),
+        }),
+    ]);
+
+    api.registerTool({
+        name: 'mac_steps',
+        label: 'Run steps',
+        description: `Send several actions to one native Mac app as one call, in order: each step is op (press, click, type, key, menu, paste, open_files or expect) with the arguments of that op's own mac tool, and an optional expect checked after it. Stops at the first step that fails and sends nothing after it; nothing is retried. Returns what changed in the app's focused window, and on a stop the step, the error, and picture files before and after it to open with read. state_id values come from one mac_state read before the call, so a control that appears mid-run is named by its label instead. Not while a mac_route recording is open. ${actionNote}`,
+        approval: 'write',
+        approvalCacheTargets: approvalTargets,
+        parameters: z.object({ app, steps: z.array(step).min(1) }),
+        ...presentation('Run steps', 'steps'),
+        async execute(_toolCallId, { app: targetApp, steps }, signal, _onUpdate, ctx) {
+            return queued(
+                { verb: 'steps', app: targetApp, agent_id: macAgentId(ctx), args: { steps } },
                 signal,
             );
         },

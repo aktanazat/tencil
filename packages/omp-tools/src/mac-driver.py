@@ -41,8 +41,10 @@ ARGUMENTS = {
     "sdef": set(),
     "paste": {"text", "html", "rtf", "tsv", "files", "window_id", "timeout"},
     "open_files": {"files", "timeout"},
+    "steps": {"steps"},
 }
 INPUT = {"press", "click", "type", "key", "script", "menu", "paste", "open_files"}
+STEP_OPS = {"press", "click", "type", "key", "menu", "paste", "open_files", "expect"}
 SCRIPTABLE = "This app is scriptable: prefer one mac_script to a series of clicks"
 # A recording spans the agent's turns, and the harness gives it one deadline.
 RECORDING_S = 600.0
@@ -153,12 +155,47 @@ def scriptable(path: object) -> bool:
     )
 
 
-def held(mac: MacOS, app: str | int, state_id: object, window_id: object = None) -> dict[str, object]:
-    state = mac.state(app, window_id=window_id)
+def held(mac: MacOS, app: str | int, state_id: object, window_id: object = None, states: dict | None = None):
+    states = {} if states is None else states
+    if window_id not in states:
+        states[window_id] = mac.state(app, window_id=window_id)
     try:
-        return state[state_id]
+        return states[window_id][state_id]
     except KeyError as exc:
         raise MacOSError(exc.args[0], code=ErrorCode.ELEMENT_UNKNOWN) from None
+
+
+def targeted(mac: MacOS, app: str | int, verb: str, values: dict[str, object], states: dict) -> None:
+    window_id = values.pop("window_id", None) if verb == "press" else values.get("window_id")
+    state_id = values.pop("state_id", None)
+    if state_id is not None:
+        values["element"] = held(mac, app, state_id, window_id, states)
+    elif verb == "press" and window_id is not None:
+        raise MacOSError("window_id goes with a state_id from that window", code=ErrorCode.BAD_REQUEST)
+
+
+def steps(mac: MacOS, app: str | int, values: dict[str, object]) -> dict[str, object]:
+    states: dict = {}
+    calls = []
+    for index, step in enumerate(values["steps"]):
+        op = step.get("op") if isinstance(step, dict) else None
+        if op not in STEP_OPS:
+            raise MacOSError(
+                f"steps[{index}] needs op, one of {', '.join(sorted(STEP_OPS))}", code=ErrorCode.BAD_REQUEST
+            )
+        expect = step.get("expect")
+        if op == "expect":
+            if expect is None:
+                raise MacOSError(f"steps[{index}] is an expect step with no expect", code=ErrorCode.BAD_REQUEST)
+            calls.append({"op": "expect", "condition": postcondition(expect)})
+            continue
+        args = arguments({key: value for key, value in step.items() if key not in ("op", "expect")}, ARGUMENTS[op])
+        targeted(mac, app, op, args, states)
+        if expect is not None:
+            args["postcondition"] = postcondition(expect)
+        calls.append({"op": "menu_search" if op == "menu" else op, **args})
+    result = mac.do.steps(calls, app=app)
+    return {"steps": result.to_json(), "summary": str(result)}
 
 
 def locator(mac: MacOS, app: str | int, values: dict[str, object]) -> dict[str, str]:
@@ -294,6 +331,11 @@ def run(session: Session, request: dict[str, object]) -> object:
         mac = session.macs[agent_id] = MacOS(agent_id=agent_id)
     if verb == "route":
         return route(session, mac, agent_id, app, values)
+    if verb == "steps" and agent_id in session.recordings:
+        raise MacOSError(
+            "A recording takes one press or key per call; send the steps one at a time or close the recording",
+            code=ErrorCode.BAD_REQUEST,
+        )
     if agent_id in session.recordings and verb in INPUT:
         return record(session, mac, agent_id, app, verb, values, request.get("expect"))
     if verb == "see":
@@ -324,14 +366,11 @@ def run(session: Session, request: dict[str, object]) -> object:
         return mac.sdef(app)
     if verb == "menus":
         return {"matches": mac.menu_search(app=app, **values)}
+    if verb == "steps":
+        return steps(mac, app, values)
     if verb == "menu":
         verb = "menu_search"
-    window_id = values.pop("window_id", None) if verb == "press" else values.get("window_id")
-    state_id = values.pop("state_id", None)
-    if state_id is not None:
-        values["element"] = held(mac, app, state_id, window_id)
-    elif verb == "press" and window_id is not None:
-        raise MacOSError("window_id goes with a state_id from that window", code=ErrorCode.BAD_REQUEST)
+    targeted(mac, app, verb, values, {})
     expect = request.get("expect")
     if expect is not None:
         values["postcondition"] = postcondition(expect)

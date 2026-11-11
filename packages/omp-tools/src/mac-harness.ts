@@ -18,8 +18,23 @@ type MacVerb =
     | 'type'
     | 'key'
     | 'script'
-    | 'route';
-type ResultKind = 'see' | 'state' | 'query' | 'handoff' | 'receipt' | 'script' | 'route' | 'error';
+    | 'route'
+    | 'menus'
+    | 'menu'
+    | 'sdef'
+    | 'paste'
+    | 'open_files';
+type ResultKind =
+    | 'see'
+    | 'state'
+    | 'query'
+    | 'handoff'
+    | 'receipt'
+    | 'script'
+    | 'route'
+    | 'menus'
+    | 'sdef'
+    | 'error';
 type Tone = 'neutral' | 'success' | 'warning' | 'error';
 
 interface MacDetails {
@@ -53,6 +68,15 @@ const driver = fileURLToPath(new URL('./mac-driver.py', import.meta.url));
 const python = join(homedir(), '.local/share/uv/tools/macos-harness/bin/python');
 const actionNote =
     'Does not activate the app or move the physical pointer. Never retry an action whose receipt says acted=yes or unknown before checking mac_state, mac_see or mac_query.';
+const RECEIPT_VERBS: readonly MacVerb[] = [
+    'press',
+    'click',
+    'type',
+    'key',
+    'menu',
+    'paste',
+    'open_files',
+];
 
 function object(value: unknown): Record<string, unknown> | undefined {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
@@ -89,6 +113,14 @@ function subject(verb: MacVerb, args: unknown): string {
         return value === undefined ? '' : `${value.length} characters`;
     }
     if (verb === 'key') return string(values.key) ?? '';
+    if (verb === 'menus' || verb === 'menu') return string(values.text) ?? '';
+    if (verb === 'sdef') return '';
+    if (verb === 'paste' || verb === 'open_files') {
+        const value = string(values.text);
+        const files = Array.isArray(values.files) ? values.files.length : 0;
+        if (value !== undefined) return `${value.length} characters`;
+        return files ? `${files} files` : 'rich text';
+    }
     if (verb === 'script') return string(values.language) ?? 'AppleScript';
     if (verb === 'route')
         return [values.action, values.name].filter(value => typeof value === 'string').join(' ');
@@ -269,6 +301,30 @@ function summarize(result: AgentToolResult<MacDetails>): Summary {
             facts: [['visited', display(data.visited)]],
             message: lines.length ? lines.join('\n') : 'No matches.',
             tone: data.complete === false ? 'warning' : 'neutral',
+        };
+    }
+    if (kind === 'menus') {
+        const matches = Array.isArray(data.matches) ? data.matches.map(object) : [];
+        const lines = matches.map(
+            item =>
+                `${display(item?.path)}${item?.shortcut ? ` (${display(item.shortcut)})` : ''}${item?.enabled === false ? ' · disabled' : ''}`,
+        );
+        return {
+            meta: [`${matches.length} items`],
+            facts: [],
+            message: lines.length ? lines.join('\n') : 'No menu item matches.',
+            tone: 'neutral',
+        };
+    }
+    if (kind === 'sdef') {
+        const count = (key: string) => {
+            const value = data[key];
+            return Array.isArray(value) ? value.length : Object.keys(object(value) ?? {}).length;
+        };
+        return {
+            meta: [`${count('commands')} commands`, `${count('classes')} classes`],
+            facts: [],
+            tone: 'neutral',
         };
     }
     if (kind === 'route') {
@@ -485,7 +541,7 @@ async function invoke(request: DriverRequest, signal: AbortSignal | undefined): 
     }
     const reply = await driverFor(request.app).request(JSON.stringify(request), signal);
     if ('aborted' in reply || signal?.aborted) {
-        const action = ['press', 'click', 'type', 'key', 'script', 'route'].includes(request.verb);
+        const action = ['script', 'route', ...RECEIPT_VERBS].includes(request.verb);
         throw new Error(
             action
                 ? 'Mac input was interrupted. Whether input was sent is unknown. Run mac_state or mac_see before retrying.'
@@ -512,9 +568,7 @@ async function result(
     const { data } = envelope;
     let kind: ResultKind = 'error';
     if (envelope.ok) {
-        kind = ['press', 'click', 'type', 'key'].includes(request.verb)
-            ? 'receipt'
-            : (request.verb as ResultKind);
+        kind = RECEIPT_VERBS.includes(request.verb) ? 'receipt' : (request.verb as ResultKind);
     }
     const details: MacDetails = { kind, app: request.app, data };
     if (kind === 'see') {
@@ -544,6 +598,9 @@ async function result(
             ],
             details,
         };
+    }
+    if (kind === 'menus' || kind === 'sdef') {
+        return { content: [{ type: 'text', text: JSON.stringify(data) }], details };
     }
     if (kind === 'route') {
         const run = object(data.run);
@@ -796,8 +853,13 @@ export function registerMacHarness(api: ExtensionAPI): void {
                 .number()
                 .int()
                 .nonnegative()
-                .describe('An id from the last mac_state of this app; use no selector with it.')
+                .describe(
+                    "An id from the last mac_state of this app's window; use no selector with it.",
+                )
                 .optional(),
+            window_id: windowId.describe(
+                'With state_id: the window_id of the mac_state the id came from, when that was not the focused window.',
+            ),
             timeout,
             expect,
         }),
@@ -991,6 +1053,157 @@ export function registerMacHarness(api: ExtensionAPI): void {
         async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
             return queued(
                 { verb: 'route', app: targetApp, agent_id: macAgentId(ctx), args },
+                signal,
+            );
+        },
+    });
+
+    api.registerTool({
+        name: 'mac_menus',
+        label: 'Search menus',
+        description:
+            "Find menu bar items of a native Mac app by words, at any depth, without opening a menu. Returns each item's path, whether it is enabled, and its shortcut. The first read of an app's menus takes up to a few seconds and is kept until the app updates. mac_menu chooses the best match.",
+        approval: 'read',
+        parameters: z.object({
+            app,
+            text: z.string().min(1).describe('Words of the item title or its menu path.'),
+            limit: z.number().int().positive().describe('Maximum items, default 10.').optional(),
+        }),
+        ...presentation('Search menus', 'menus'),
+        async execute(_toolCallId, { app: targetApp, ...args }, signal, _onUpdate, ctx) {
+            return queued(
+                { verb: 'menus', app: targetApp, agent_id: macAgentId(ctx), args },
+                signal,
+            );
+        },
+    });
+
+    api.registerTool({
+        name: 'mac_menu',
+        label: 'Choose menu item',
+        description: `Choose the menu item of a native Mac app that best matches text, at any depth, as mac_menus ranks it: by its shortcut when it has one and the app is in front, else by pressing it. Refuses when two items tie or the best match opens a submenu. ${actionNote}`,
+        approval: 'write',
+        approvalCacheTargets: approvalTargets,
+        parameters: z.object({
+            app,
+            text: z.string().min(1).describe('Words of the item title or its menu path.'),
+            timeout,
+            expect,
+        }),
+        ...presentation('Choose menu item', 'menu'),
+        async execute(
+            _toolCallId,
+            { app: targetApp, expect: condition, ...args },
+            signal,
+            _onUpdate,
+            ctx,
+        ) {
+            return queued(
+                {
+                    verb: 'menu',
+                    app: targetApp,
+                    agent_id: macAgentId(ctx),
+                    args,
+                    expect: condition,
+                },
+                signal,
+            );
+        },
+    });
+
+    api.registerTool({
+        name: 'mac_sdef',
+        label: 'Scripting dictionary',
+        description:
+            'List the AppleScript commands, classes and enumerations a Mac app takes, read from its bundle without launching it. Read it before writing a mac_script for an app you have not scripted. Fails for an app with no dictionary.',
+        approval: 'read',
+        parameters: z.object({ app }),
+        ...presentation('Scripting dictionary', 'sdef'),
+        async execute(_toolCallId, { app: targetApp }, signal, _onUpdate, ctx) {
+            return queued(
+                { verb: 'sdef', app: targetApp, agent_id: macAgentId(ctx), args: {} },
+                signal,
+            );
+        },
+    });
+
+    const files = z.array(z.string().min(1)).min(1).describe('Absolute paths of existing files.');
+
+    api.registerTool({
+        name: 'mac_paste',
+        label: 'Paste in app',
+        description: `Paste into the focused control of a native Mac app through the clipboard, then put the clipboard back as it was. Faster than mac_type for long text, and the only way to paste a rich table (html with tsv) or files. Give text, html, rtf, tsv or files. Works only while the app is in front; otherwise it refuses before touching the clipboard. The receipt's observed.input.pasteboard.restored says whether the clipboard went back. Never paste secrets. ${actionNote}`,
+        approval: 'write',
+        approvalCacheTargets: approvalTargets,
+        parameters: z.object({
+            app,
+            text: z.string().describe('Plain text.').optional(),
+            html: z.string().describe('HTML, as a table or styled text.').optional(),
+            rtf: z.string().describe('RTF source.').optional(),
+            tsv: z.string().describe('Tab-separated rows for spreadsheets.').optional(),
+            files: files.optional(),
+            window_id: windowId,
+            timeout,
+            expect,
+        }),
+        ...presentation('Paste in app', 'paste'),
+        async execute(
+            _toolCallId,
+            { app: targetApp, expect: condition, ...args },
+            signal,
+            _onUpdate,
+            ctx,
+        ) {
+            if (
+                [args.text, args.html, args.rtf, args.tsv, args.files].every(v => v === undefined)
+            ) {
+                throw new Error('Give text, html, rtf, tsv or files to paste.');
+            }
+            return queued(
+                {
+                    verb: 'paste',
+                    app: targetApp,
+                    agent_id: macAgentId(ctx),
+                    args,
+                    expect: condition,
+                },
+                signal,
+            );
+        },
+    });
+
+    api.registerTool({
+        name: 'mac_open_files',
+        label: 'Open files',
+        description: `Open files in a running native Mac app, as dropping them on its Dock icon does, without bringing it forward, then wait until its windows show them. ${actionNote}`,
+        approval: 'write',
+        approvalCacheTargets: approvalTargets,
+        parameters: z.object({
+            app,
+            files,
+            timeout: z
+                .number()
+                .positive()
+                .describe('Seconds to wait for the windows, default 10.')
+                .optional(),
+            expect,
+        }),
+        ...presentation('Open files', 'open_files'),
+        async execute(
+            _toolCallId,
+            { app: targetApp, expect: condition, ...args },
+            signal,
+            _onUpdate,
+            ctx,
+        ) {
+            return queued(
+                {
+                    verb: 'open_files',
+                    app: targetApp,
+                    agent_id: macAgentId(ctx),
+                    args,
+                    expect: condition,
+                },
                 signal,
             );
         },

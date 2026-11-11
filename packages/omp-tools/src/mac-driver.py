@@ -30,14 +30,19 @@ ARGUMENTS = {
     "state": {"query", "window_id", "diff"},
     "query": SELECTORS | {"limit", "visible_only"},
     "handoff": {"reason"},
-    "press": SELECTORS | {"state_id", "timeout"},
+    "press": SELECTORS | {"state_id", "window_id", "timeout"},
     "click": {"x", "y", "element", "state_id", "window_id", "screenshot", "button", "clicks", "timeout"},
     "type": {"text", "window_id", "timeout"},
     "key": {"key", "window_id", "timeout"},
     "script": {"source", "language", "timeout"},
     "route": {"action", "name", "entry", "goal", "inputs", "timeout"},
+    "menus": {"text", "limit"},
+    "menu": {"text", "timeout"},
+    "sdef": set(),
+    "paste": {"text", "html", "rtf", "tsv", "files", "window_id", "timeout"},
+    "open_files": {"files", "timeout"},
 }
-INPUT = {"press", "click", "type", "key", "script"}
+INPUT = {"press", "click", "type", "key", "script", "menu", "paste", "open_files"}
 SCRIPTABLE = "This app is scriptable: prefer one mac_script to a series of clicks"
 # A recording spans the agent's turns, and the harness gives it one deadline.
 RECORDING_S = 600.0
@@ -315,9 +320,18 @@ def run(session: Session, request: dict[str, object]) -> object:
         return {"handoff": handoff.to_json(), "prompt": handoff.to_prompt()}
     if verb == "script":
         return {"output": mac.script(**values)}
+    if verb == "sdef":
+        return mac.sdef(app)
+    if verb == "menus":
+        return {"matches": mac.menu_search(app=app, **values)}
+    if verb == "menu":
+        verb = "menu_search"
+    window_id = values.pop("window_id", None) if verb == "press" else values.get("window_id")
     state_id = values.pop("state_id", None)
     if state_id is not None:
-        values["element"] = held(mac, app, state_id, values.get("window_id"))
+        values["element"] = held(mac, app, state_id, window_id)
+    elif verb == "press" and window_id is not None:
+        raise MacOSError("window_id goes with a state_id from that window", code=ErrorCode.BAD_REQUEST)
     expect = request.get("expect")
     if expect is not None:
         values["postcondition"] = postcondition(expect)

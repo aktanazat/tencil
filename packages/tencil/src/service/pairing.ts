@@ -79,6 +79,7 @@ async function checkCodex(log: (message: string) => void): Promise<void> {
             : `  ${pc.green('✓')} Codex is ready. Pins run in your Codex login.`,
     );
 }
+
 async function checkOmp(log: (message: string) => void): Promise<void> {
     const sessions = await activeOmpSessions();
     log(

@@ -236,7 +236,7 @@ tencil connect [pairing-link] Pair with T3 Code (automatic for a local T3 Code)
 --model <model>         T3 Code: instance:model, e.g. claudeAgent:claude-fable-5-1
                         Claude Code: a model, e.g. claude-opus-5-5 (default: its default)
                         Codex: a model, e.g. gpt-6.1-sol (default: its default)
-                        OMP: an omp model selector, e.g. anthropic/claude-opus-5-5 (default: its settings)
+                        OMP uses the model and permissions of the connected chat.
 --runtime-mode <mode>   approval-required | auto-accept-edits | auto | full-access
 --listen <address>      Also listen here, e.g. a Tailscale IP (repeatable)
 --allow-origin <url>    Allow a non-localhost page to connect (repeatable)

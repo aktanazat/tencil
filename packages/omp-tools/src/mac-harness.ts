@@ -74,7 +74,7 @@ const driver = fileURLToPath(new URL('./mac-driver.py', import.meta.url));
 const python = join(homedir(), '.local/share/uv/tools/macos-harness/bin/python');
 const actionNote =
     'Does not activate the app or move the physical pointer. Never retry an action whose receipt says acted=yes or unknown before checking mac_state, mac_see or mac_query.';
-// Data reads and shortcuts belong to no app; they share one driver lane.
+// Data reads and app-less shortcuts belong to no app; each agent has its own data lane.
 const DATA_LANE = 'mac data';
 const RECEIPT_VERBS: readonly MacVerb[] = [
     'press',
@@ -458,6 +458,12 @@ function presentation(label: string, verb: MacVerb) {
 // the same turn must see the click, so calls for one app run in issue order.
 const lanes = new Map<string, Promise<unknown>>();
 
+// Data reads touch no app, so each agent gets its own: one agent's slow wait_file
+// must not hold another agent's reads.
+function lane(request: DriverRequest): string {
+    return request.app === DATA_LANE ? `${DATA_LANE}\n${request.agent_id}` : request.app;
+}
+
 function inLane<T>(app: string, run: () => Promise<T>): Promise<T> {
     const next = (lanes.get(app) ?? Promise.resolve()).then(run, run);
     const settled = next.then(
@@ -594,7 +600,7 @@ async function invoke(request: DriverRequest, signal: AbortSignal | undefined): 
             'Provide a mac_state id, a mac_query element match, or x and y together with the screenshot path from mac_see.',
         );
     }
-    const reply = await driverFor(request.app).request(JSON.stringify(request), signal);
+    const reply = await driverFor(lane(request)).request(JSON.stringify(request), signal);
     if ('aborted' in reply || signal?.aborted) {
         const action = ['script', 'route', 'steps', 'shortcut', ...RECEIPT_VERBS].includes(
             request.verb,
@@ -782,7 +788,7 @@ async function queued(
         batch.stopAfter = batch.issued;
     };
     try {
-        return await inLane(request.app, async () => {
+        return await inLane(lane(request), async () => {
             if (index <= batch.stopAfter && request.verb !== 'data') return notRun(request, batch);
             let answer: AgentToolResult<MacDetails>;
             try {

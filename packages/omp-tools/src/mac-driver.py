@@ -395,6 +395,11 @@ def run(session: Session, request: dict[str, object]) -> object:
     if verb == "data":
         return data(mac, values)
     if verb == "shortcut":
+        if "-" in (values.get("input") or ()):
+            raise MacOSError(
+                "input takes file paths; write the text to a file and pass its path",
+                code=ErrorCode.BAD_REQUEST,
+            )
         return {"data": plain(mac.data.run_shortcut(**values))}
     if verb == "menu":
         verb = "menu_search"

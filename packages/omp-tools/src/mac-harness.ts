@@ -742,7 +742,7 @@ async function queued(
                 code === undefined
                     ? (string(object(answer.details?.data.receipt)?.outcome) ?? 'ok')
                     : `failed (${code})`,
-                code !== undefined,
+                code !== undefined && request.verb !== 'data',
             );
             return answer;
         });
@@ -1072,7 +1072,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
         name: 'mac_route',
         label: 'Saved route',
         description:
-            "Save presses and keys in one app as a named route while you do a task once, then replay it later in one call. record starts a recording: give name, entry (true now) and goal (true once done, not now), each naming a control by role and one exact title, description or identifier. Until save, your mac_press and mac_key calls on this app are saved as steps and each needs such an expect; mac_click, mac_type and mac_script calls on it are refused. save checks the goal and writes the route, cancel drops it, and a recording closes after 10 minutes. run replays a saved route and stops at the first step that does not confirm; list shows this app's routes.",
+            "Save presses and keys in one app as a named route while you do a task once, then replay it later in one call. record starts a recording: give name, entry (true now) and goal (true once done, not now), each naming a control by role and one exact title, description or identifier. Until save, your mac_press and mac_key calls on this app are saved as steps and each needs such an expect; mac_click, mac_type, mac_script, mac_steps and mac_shortcut calls on it are refused. save checks the goal and writes the route, cancel drops it, and a recording closes after 10 minutes. run replays a saved route and stops at the first step that does not confirm; list shows this app's routes.",
         approval: 'write',
         approvalCacheTargets: approvalTargets,
         parameters: z.object({
@@ -1398,10 +1398,11 @@ export function registerMacHarness(api: ExtensionAPI): void {
         name: 'mac_shortcut',
         label: 'Run shortcut',
         description:
-            "Run one of the user's Shortcuts by name with no Shortcuts window, optionally on input files, and return what it wrote. A shortcut can act on any app or send messages: run only one the user named or mac_data shortcuts listed for this task.",
+            "Run one of the user's Shortcuts by name with no Shortcuts window, optionally on input files, and return what it wrote. A shortcut can act on any app or send messages: run only one the user named or mac_data shortcuts listed for this task. When it acts on an app, name it: app orders this call with your other calls for that app.",
         approval: 'exec',
         parameters: z.object({
             name: z.string().min(1),
+            app: app.optional(),
             input: z.array(z.string().min(1)).describe('Input file paths.').optional(),
             output: z
                 .string()
@@ -1412,11 +1413,11 @@ export function registerMacHarness(api: ExtensionAPI): void {
             timeout: z.number().positive().describe('Seconds, default 60.').optional(),
         }),
         ...presentation('Run shortcut', 'shortcut'),
-        async execute(_toolCallId, { name, ...rest }, signal, _onUpdate, ctx) {
+        async execute(_toolCallId, { name, app: targetApp, ...rest }, signal, _onUpdate, ctx) {
             return queued(
                 {
                     verb: 'shortcut',
-                    app: DATA_LANE,
+                    app: targetApp ?? DATA_LANE,
                     agent_id: macAgentId(ctx),
                     args: { name, ...rest },
                 },

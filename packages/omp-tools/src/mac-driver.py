@@ -5,6 +5,7 @@ import json
 import plistlib
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -359,6 +360,7 @@ def route(
             goal=exact(values.get("goal"), "goal", CHECK_S), timeout=timeout,
         )
         session.watches[agent_id] = Watching(name, handle, timeout)
+        threading.Thread(target=handle.wait, daemon=True).start()
         return {"watching": name, "app": bundle}
     if action == "record":
         context = mac.route.record(

@@ -207,7 +207,7 @@ function replayNote(app: string, run: Record<string, unknown>): string {
 
 function routeNote(app: string, data: Record<string, unknown>): string {
     if (typeof data.watching === 'string') {
-        return `Watching ${data.watching}: ask the person to do the task by hand in ${app} at an easy pace and press Control-Option-Command-Period when done, then call mac_route stop to save it. Calling stop earlier ends the watch at once.`;
+        return `Watching ${data.watching}: ask the person to do the task by hand in ${app} at an easy pace and press Control-Option-Command-Period when done; the route is saved then. Call mac_route stop for the result; calling it earlier ends the watch at once.`;
     }
     const watch = object(data.watch);
     if (watch) {
@@ -383,10 +383,12 @@ function summarize(result: AgentToolResult<MacDetails>): Summary {
             facts: [],
             message: routeNote(details.app, data),
             tone:
-                (run && run.status !== 'done' && run.status !== 'already') ||
-                object(data.watch)?.status === 'unsaved'
-                    ? 'error'
-                    : 'neutral',
+                run?.status === 'handoff'
+                    ? 'warning'
+                    : (run && run.status !== 'done' && run.status !== 'already') ||
+                        object(data.watch)?.status === 'unsaved'
+                      ? 'error'
+                      : 'neutral',
         };
     }
     return {
@@ -720,10 +722,16 @@ interface Batch {
 // issued after the failure runs.
 const batches = new Map<string, Batch>();
 
+// While the person does a task by hand, an agent's input anywhere would land in or
+// disturb it; the driver alone cannot see another spelling of the app.
+const watching = new Map<string, string>();
+const WATCH_REFUSED = new Set<string>([...RECEIPT_VERBS, 'script', 'steps', 'shortcut']);
+
 function failure(result: AgentToolResult<MacDetails>): string | undefined {
     const data = result.details?.data ?? {};
     const receipt = object(data.receipt);
     if (!result.isError && receipt?.outcome !== 'failed') return undefined;
+    if (object(data.run)?.status === 'handoff') return 'handoff';
     return (
         string(object(data.error ?? object(data.run)?.error ?? object(data.steps)?.error)?.code) ??
         'error'
@@ -743,6 +751,24 @@ async function queued(
     request: DriverRequest,
     signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<MacDetails>> {
+    const action = string(request.args.action);
+    const watched = watching.get(request.agent_id);
+    if (
+        watched !== undefined &&
+        (WATCH_REFUSED.has(request.verb) ||
+            (request.verb === 'route' && action !== 'list' && action !== 'stop'))
+    ) {
+        const message = `The person is doing a task by hand in ${watched}; mac_route stop on ${watched} ends the watch first.`;
+        return {
+            content: [{ type: 'text', text: message }],
+            details: {
+                kind: 'error',
+                app: request.app,
+                data: { error: { code: 'watching', message } },
+            },
+            isError: true,
+        };
+    }
     const key = `${request.agent_id}\n${request.app}`;
     const batch = batches.get(key) ?? { pending: 0, issued: 0, stopAfter: 0, failed: '', ran: [] };
     batches.set(key, batch);
@@ -757,7 +783,7 @@ async function queued(
     };
     try {
         return await inLane(request.app, async () => {
-            if (index <= batch.stopAfter) return notRun(request, batch);
+            if (index <= batch.stopAfter && request.verb !== 'data') return notRun(request, batch);
             let answer: AgentToolResult<MacDetails>;
             try {
                 answer = await result(request, signal);
@@ -770,8 +796,12 @@ async function queued(
                 code === undefined
                     ? (string(object(answer.details?.data.receipt)?.outcome) ?? 'ok')
                     : `failed (${code})`,
-                code !== undefined && request.verb !== 'data',
+                code !== undefined,
             );
+            if (request.verb === 'route' && action === 'stop') watching.delete(request.agent_id);
+            if (typeof answer.details?.data.watching === 'string') {
+                watching.set(request.agent_id, request.app);
+            }
             return answer;
         });
     } finally {
@@ -1100,7 +1130,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
         name: 'mac_route',
         label: 'Saved route',
         description:
-            "Save presses and keys in one app as a named route while you do a task once, then replay it later in one call. record starts a recording: give name, entry (true now) and goal (true once done, not now), each naming a control by role and one exact title, description or identifier. Until save, your mac_press and mac_key calls on this app are saved as steps and each needs such an expect; mac_click, mac_type, mac_script, mac_steps and mac_shortcut calls on it are refused. save checks the goal and writes the route, cancel drops it, and a recording closes after 10 minutes. watch takes the same name, entry and goal and learns the route while the person does the task by hand; stop ends it and saves the route once its goal holds, and your input calls on this app are refused until then. Text typed into a password field is never saved: replay stops there and hands that step to the person. run replays a saved route and stops at the first step that does not confirm; list shows this app's routes.",
+            "Save presses and keys in one app as a named route while you do a task once, then replay it later in one call. record starts a recording: give name, entry (true now) and goal (true once done, not now), each naming a control by role and one exact title, description or identifier. Until save, your mac_press and mac_key calls on this app are saved as steps and each needs such an expect; mac_click, mac_type, mac_script, mac_steps and mac_shortcut calls on it are refused. save checks the goal and writes the route, cancel drops it, and a recording closes after 10 minutes. watch takes the same name, entry and goal and learns the route while the person does the task by hand; the route is saved as soon as the person finishes if its goal holds, stop ends the watch and returns the result, and your input calls and routes on every app are refused until stop. Text typed into a password field is never saved: replay stops there and hands that step to the person. run replays a saved route and stops at the first step that does not confirm; list shows this app's routes.",
         approval: 'write',
         approvalCacheTargets: approvalTargets,
         parameters: z.object({
@@ -1109,7 +1139,9 @@ export function registerMacHarness(api: ExtensionAPI): void {
             name: z
                 .string()
                 .regex(/^[a-z0-9-]{1,64}$/)
-                .describe('Route name for record, watch and run: lowercase letters, digits and hyphens.')
+                .describe(
+                    'Route name for record, watch and run: lowercase letters, digits and hyphens.',
+                )
                 .optional(),
             entry: condition
                 .describe('record or watch: true now, before the first step.')
@@ -1124,6 +1156,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
             timeout: z
                 .number()
                 .positive()
+                .max(3600)
                 .describe(
                     'run: seconds for the whole replay, default 30; watch: seconds the person has, default 300.',
                 )
@@ -1430,7 +1463,7 @@ export function registerMacHarness(api: ExtensionAPI): void {
         name: 'mac_shortcut',
         label: 'Run shortcut',
         description:
-            "Run one of the user's Shortcuts by name with no Shortcuts window, optionally on input files, and return what it wrote. A shortcut can act on any app or send messages: run only one the user named or mac_data shortcuts listed for this task. When it acts on an app, name it: app orders this call with your other calls for that app.",
+            "Run one of the user's Shortcuts by name with no Shortcuts window, optionally on input files, and return what it wrote. A shortcut can act on any app or send messages: run only one the user named or mac_data shortcuts listed for this task. When it acts on an app, name it: app orders this call with your other calls for that app. When it needs a file mac_data wait_file is waiting for, call it only after that wait returns.",
         approval: 'exec',
         parameters: z.object({
             name: z.string().min(1),

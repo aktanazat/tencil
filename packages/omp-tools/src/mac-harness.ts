@@ -206,6 +206,16 @@ function replayNote(app: string, run: Record<string, unknown>): string {
 }
 
 function routeNote(app: string, data: Record<string, unknown>): string {
+    if (typeof data.watching === 'string') {
+        return `Watching ${data.watching}: ask the person to do the task by hand in ${app} at an easy pace and press Control-Option-Command-Period when done, then call mac_route stop to save it. Calling stop earlier ends the watch at once.`;
+    }
+    const watch = object(data.watch);
+    if (watch) {
+        const steps = Array.isArray(watch.steps) ? watch.steps.length : 0;
+        return watch.status === 'saved'
+            ? `Saved ${display(watch.name)} with ${steps} steps; mac_route run replays it in one call.`
+            : `Not saved: ${string(object(watch.error)?.message) ?? display(watch.stopped_by)}`;
+    }
     if (typeof data.recording === 'string') {
         return `Recording ${data.recording}: your mac_press and mac_key calls on ${app} are saved as its steps, each with its expect, until mac_route save.`;
     }
@@ -226,7 +236,13 @@ function routeNote(app: string, data: Record<string, unknown>): string {
         });
         return lines.length ? lines.join('\n') : `No routes saved for ${app}.`;
     }
-    return replayNote(app, object(data.run) ?? {});
+    const run = object(data.run) ?? {};
+    if (run.status === 'handoff') {
+        const index = /^steps\[(\d+)\]$/.exec(string(run.at) ?? '')?.[1];
+        const step = index === undefined ? '' : ` at step ${Number(index) + 1}`;
+        return `Replay stopped${step} for the person: ${string(data.prompt) ?? 'they must finish this step by hand'}`;
+    }
+    return replayNote(app, run);
 }
 
 function summarize(result: AgentToolResult<MacDetails>): Summary {
@@ -366,7 +382,11 @@ function summarize(result: AgentToolResult<MacDetails>): Summary {
             meta: run ? [display(run.status)] : [],
             facts: [],
             message: routeNote(details.app, data),
-            tone: run && run.status !== 'done' && run.status !== 'already' ? 'error' : 'neutral',
+            tone:
+                (run && run.status !== 'done' && run.status !== 'already') ||
+                object(data.watch)?.status === 'unsaved'
+                    ? 'error'
+                    : 'neutral',
         };
     }
     return {
@@ -650,18 +670,26 @@ async function result(
     if (kind === 'route') {
         const run = object(data.run);
         const stopped = run !== undefined && run.status !== 'done' && run.status !== 'already';
+        const unsaved = object(data.watch)?.status === 'unsaved';
         const steps = Array.isArray(data.steps) ? data.steps.join('\n') : '';
         return {
             content: [
                 {
                     type: 'text',
-                    text: [routeNote(request.app, data), stopped ? JSON.stringify(run) : steps]
+                    text: [
+                        routeNote(request.app, data),
+                        stopped
+                            ? JSON.stringify(run)
+                            : unsaved
+                              ? JSON.stringify(data.watch)
+                              : steps,
+                    ]
                         .filter(Boolean)
                         .join('\n'),
                 },
             ],
             details,
-            isError: stopped,
+            isError: stopped || unsaved,
         };
     }
     const summary =
@@ -1072,20 +1100,22 @@ export function registerMacHarness(api: ExtensionAPI): void {
         name: 'mac_route',
         label: 'Saved route',
         description:
-            "Save presses and keys in one app as a named route while you do a task once, then replay it later in one call. record starts a recording: give name, entry (true now) and goal (true once done, not now), each naming a control by role and one exact title, description or identifier. Until save, your mac_press and mac_key calls on this app are saved as steps and each needs such an expect; mac_click, mac_type, mac_script, mac_steps and mac_shortcut calls on it are refused. save checks the goal and writes the route, cancel drops it, and a recording closes after 10 minutes. run replays a saved route and stops at the first step that does not confirm; list shows this app's routes.",
+            "Save presses and keys in one app as a named route while you do a task once, then replay it later in one call. record starts a recording: give name, entry (true now) and goal (true once done, not now), each naming a control by role and one exact title, description or identifier. Until save, your mac_press and mac_key calls on this app are saved as steps and each needs such an expect; mac_click, mac_type, mac_script, mac_steps and mac_shortcut calls on it are refused. save checks the goal and writes the route, cancel drops it, and a recording closes after 10 minutes. watch takes the same name, entry and goal and learns the route while the person does the task by hand; stop ends it and saves the route once its goal holds, and your input calls on this app are refused until then. Text typed into a password field is never saved: replay stops there and hands that step to the person. run replays a saved route and stops at the first step that does not confirm; list shows this app's routes.",
         approval: 'write',
         approvalCacheTargets: approvalTargets,
         parameters: z.object({
             app,
-            action: z.enum(['record', 'save', 'cancel', 'run', 'list']),
+            action: z.enum(['record', 'save', 'cancel', 'run', 'list', 'watch', 'stop']),
             name: z
                 .string()
                 .regex(/^[a-z0-9-]{1,64}$/)
-                .describe('Route name for record and run: lowercase letters, digits and hyphens.')
+                .describe('Route name for record, watch and run: lowercase letters, digits and hyphens.')
                 .optional(),
-            entry: condition.describe('record: true now, before the first step.').optional(),
+            entry: condition
+                .describe('record or watch: true now, before the first step.')
+                .optional(),
             goal: condition
-                .describe('record: true once the route is done, and false now.')
+                .describe('record or watch: true once the route is done, and false now.')
                 .optional(),
             inputs: z
                 .record(z.string(), z.string())
@@ -1094,7 +1124,9 @@ export function registerMacHarness(api: ExtensionAPI): void {
             timeout: z
                 .number()
                 .positive()
-                .describe('run: seconds for the whole replay, default 30.')
+                .describe(
+                    'run: seconds for the whole replay, default 30; watch: seconds the person has, default 300.',
+                )
                 .optional(),
         }),
         ...presentation('Saved route', 'route'),

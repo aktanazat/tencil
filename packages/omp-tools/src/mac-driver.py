@@ -21,6 +21,7 @@ from macos_harness import (
     present,
 )
 from macos_harness.errors import ErrorCode
+from macos_harness.watch import RouteWatch
 
 SELECTORS = {"text", "role", "title", "identifier", "description"}
 # The fields a route finds a control by, in the order mac.state labels it.
@@ -86,15 +87,27 @@ class Recording:
 
 
 @dataclass
+class Watching:
+    name: str
+    handle: RouteWatch
+    timeout: float
+    started: float = field(default_factory=time.monotonic)
+
+
+@dataclass
 class Session:
     macs: dict[str, MacOS] = field(default_factory=dict)
     scriptable: dict[str | int, bool] = field(default_factory=dict)
     recordings: dict[str, Recording] = field(default_factory=dict)
+    watches: dict[str, Watching] = field(default_factory=dict)
 
     def hold(self) -> float:
         now = time.monotonic()
+        # A watch saves its route only at mac_route stop, so the driver
+        # outlives the watch by a recording's span for that call.
         return max(
-            (RECORDING_S - (now - recording.started) for recording in self.recordings.values()),
+            [RECORDING_S - (now - recording.started) for recording in self.recordings.values()]
+            + [watch.timeout + RECORDING_S - (now - watch.started) for watch in self.watches.values()],
             default=0.0,
         )
 
@@ -293,6 +306,17 @@ def route(
     session: Session, mac: MacOS, agent_id: str, app: str | int, values: dict[str, object]
 ) -> dict[str, object]:
     action = values.get("action")
+    watching = session.watches.get(agent_id)
+    if action == "stop":
+        if watching is None:
+            raise MacOSError("No watch is open for this app; mac_route watch starts one", code=ErrorCode.BAD_REQUEST)
+        del session.watches[agent_id]
+        return {"watch": watching.handle.stop().to_json()}
+    if watching is not None and action != "list":
+        raise MacOSError(
+            f"The person is doing {watching.name} by hand; mac_route stop ends the watch first",
+            code=ErrorCode.BAD_REQUEST,
+        )
     recording = session.recordings.get(agent_id)
     if action in ("save", "cancel"):
         if recording is None:
@@ -324,7 +348,18 @@ def route(
         result = mac.route.run(
             name, app=bundle, timeout=values.get("timeout", 30.0), inputs=values.get("inputs")
         )
-        return {"run": result.to_json(), "steps": [str(receipt) for receipt in result.steps_run]}
+        reply: dict[str, object] = {"run": result.to_json(), "steps": [str(receipt) for receipt in result.steps_run]}
+        if result.handoff is not None:
+            reply["prompt"] = result.handoff.to_prompt()
+        return reply
+    if action == "watch":
+        timeout = values.get("timeout", 300.0)
+        handle = mac.route.watch(
+            name, app=bundle, entry=exact(values.get("entry"), "entry", CHECK_S),
+            goal=exact(values.get("goal"), "goal", CHECK_S), timeout=timeout,
+        )
+        session.watches[agent_id] = Watching(name, handle, timeout)
+        return {"watching": name, "app": bundle}
     if action == "record":
         context = mac.route.record(
             name, app=bundle, entry=exact(values.get("entry"), "entry", CHECK_S),
@@ -355,6 +390,12 @@ def run(session: Session, request: dict[str, object]) -> object:
         mac = session.macs[agent_id] = MacOS(agent_id=agent_id)
     if verb == "route":
         return route(session, mac, agent_id, app, values)
+    if (verb in INPUT or verb in UNRECORDED) and agent_id in session.watches:
+        raise MacOSError(
+            f"The person is doing {session.watches[agent_id].name} by hand in this app; "
+            "mac_route stop ends the watch first",
+            code=ErrorCode.BAD_REQUEST,
+        )
     if verb in UNRECORDED and agent_id in session.recordings:
         raise MacOSError(
             f"A recording takes one press or key per call; close the recording before {verb}",

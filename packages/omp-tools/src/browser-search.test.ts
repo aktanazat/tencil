@@ -148,7 +148,7 @@ describe('web_search', () => {
         ]);
     });
 
-    it.fails('deduplicates a text-fragment-only link against the same link without a hash', async () => {
+    it('deduplicates a text-fragment-only link against the same link without a hash', async () => {
         safari.search.mockResolvedValueOnce({
             ...found,
             results: [{ ...result, url: `${result.url}#:~:text=highlight` }, result],

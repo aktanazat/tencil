@@ -163,7 +163,7 @@ function cleanUrl(raw: string): string | undefined {
     if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined;
     url.searchParams.delete('srsltid');
     const fragment = url.hash.indexOf(':~:text=');
-    if (fragment !== -1) url.hash = url.hash.slice(0, fragment);
+    if (fragment !== -1) url.hash = fragment === 1 ? '' : url.hash.slice(0, fragment);
     return url.href;
 }
 

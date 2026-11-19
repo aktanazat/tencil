@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { ProviderInfo, ProviderMessage, ThreadSink, ThreadStep } from '@tencildev/protocol';
 import { FakeCodexAppServer, type FakeCodexItem, waitFor } from '@tencildev/testing';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AppServerProcess } from './app-server.ts';
 import { CodexProvider, type CodexProviderOptions } from './codex-provider.ts';
 import { NOT_INSTALLED } from './find-codex.ts';
@@ -14,6 +14,7 @@ const PNG =
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => {
+    vi.useRealTimers();
     while (cleanup.length) await cleanup.pop()?.();
 });
 
@@ -286,6 +287,32 @@ describe('Codex provider', () => {
         expect(codex.alive).toBe(1);
         codex.release();
         await reply();
+    });
+
+    it('keeps the process while a request is still starting the thread', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        const codex = new FakeCodexAppServer();
+        let resume = () => {};
+        const { provider } = setup({
+            idleCloseMs: 5,
+            spawn: () => {
+                const process = codex.spawn();
+                process.stdin.pause();
+                resume = () => process.stdin.resume();
+                return process as unknown as AppServerProcess;
+            },
+        });
+        const creating = provider.createThread(newThread());
+        await vi.advanceTimersByTimeAsync(40);
+        expect(codex.alive).toBe(1);
+        expect(codex.requestsOf('thread/start')).toEqual([]);
+        resume();
+        vi.useRealTimers();
+        const { providerThreadId } = await creating;
+        const { sink, reply } = recordingSink();
+        provider.watch(providerThreadId, sink);
+        expect((await reply()).text).toBe('Done: Tighten the hero');
+        await waitFor(() => codex.alive === 0, { message: 'idle process closed' });
     });
 
     it('replays a thread from Codex after a restart, with ids that line up', async () => {

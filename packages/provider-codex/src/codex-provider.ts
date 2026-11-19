@@ -102,6 +102,7 @@ export class CodexProvider implements Provider {
     #recheckTimer: ReturnType<typeof setTimeout> | undefined;
     readonly #sessions = new Map<string, Session>();
     #disposed = false;
+    #operations = 0;
 
     constructor(options: CodexProviderOptions) {
         this.#options = options;
@@ -109,23 +110,28 @@ export class CodexProvider implements Provider {
 
     /** Whether Codex is there and signed in. Looks again until it is: both happen outside Tencil. */
     async start(): Promise<void> {
-        clearTimeout(this.#recheckTimer);
-        try {
-            const [server, workspace] = await Promise.all([this.#connect(), this.#workspaceRoot()]);
-            const { account, requiresOpenaiAuth } = await server.request<AccountRead>(
-                'account/read',
-                {},
-            );
-            if (!account && requiresOpenaiAuth) {
-                this.#signedOut(NOT_SIGNED_IN);
-                return;
+        return this.#whileInUse(async () => {
+            clearTimeout(this.#recheckTimer);
+            try {
+                const [server, workspace] = await Promise.all([
+                    this.#connect(),
+                    this.#workspaceRoot(),
+                ]);
+                const { account, requiresOpenaiAuth } = await server.request<AccountRead>(
+                    'account/read',
+                    {},
+                );
+                if (!account && requiresOpenaiAuth) {
+                    this.#signedOut(NOT_SIGNED_IN);
+                    return;
+                }
+                this.#setInfo({ state: 'ready', target: basename(workspace) });
+                this.#log(`Codex ready in ${workspace}`);
+            } catch (error) {
+                this.#setInfo({ state: 'unavailable', detail: errorMessage(error) });
+                this.#recheckLater();
             }
-            this.#setInfo({ state: 'ready', target: basename(workspace) });
-            this.#log(`Codex ready in ${workspace}`);
-        } catch (error) {
-            this.#setInfo({ state: 'unavailable', detail: errorMessage(error) });
-            this.#recheckLater();
-        }
+        });
     }
 
     info(): ProviderInfo {
@@ -138,43 +144,47 @@ export class CodexProvider implements Provider {
     }
 
     async listThreads(): Promise<{ project: ProviderProject; threads: ProviderThreadSummary[] }> {
-        const [server, workspace] = await Promise.all([this.#connect(), this.#workspaceRoot()]);
-        const { data } = await server.request<Page<CodexThread>>('thread/list', {
-            cwd: workspace,
-            sortKey: 'updated_at',
-            limit: LISTED_THREADS,
+        return this.#whileInUse(async () => {
+            const [server, workspace] = await Promise.all([this.#connect(), this.#workspaceRoot()]);
+            const { data } = await server.request<Page<CodexThread>>('thread/list', {
+                cwd: workspace,
+                sortKey: 'updated_at',
+                limit: LISTED_THREADS,
+            });
+            const threads = data.map(
+                (thread): ProviderThreadSummary => ({
+                    id: thread.id,
+                    title: thread.name || thread.preview?.split('\n', 1)[0] || 'New thread',
+                    status: this.#status(thread.id).status,
+                    updatedAt: new Date(thread.updatedAt * 1000).toISOString(),
+                    ...(thread.gitInfo?.branch ? { branch: thread.gitInfo.branch } : {}),
+                    agent: 'codex',
+                }),
+            );
+            return { project: { name: basename(workspace) }, threads };
         });
-        const threads = data.map(
-            (thread): ProviderThreadSummary => ({
-                id: thread.id,
-                title: thread.name || thread.preview?.split('\n', 1)[0] || 'New thread',
-                status: this.#status(thread.id).status,
-                updatedAt: new Date(thread.updatedAt * 1000).toISOString(),
-                ...(thread.gitInfo?.branch ? { branch: thread.gitInfo.branch } : {}),
-                agent: 'codex',
-            }),
-        );
-        return { project: { name: basename(workspace) }, threads };
     }
 
     async listModels(): Promise<ProviderModels> {
-        const [server, workspace] = await Promise.all([this.#connect(), this.#workspaceRoot()]);
-        const available = await pages<CodexModel>(cursor =>
-            server.request('model/list', { cursor, limit: PAGE_SIZE }),
-        );
-        const models = available.filter(model => !model.hidden).map(toModel);
-        // What a thread gets when it names no model: `--model`, then the user's config.
-        const { config } = await server
-            .request<{ config?: { model?: string | null } }>('config/read', { cwd: workspace })
-            .catch(() => ({ config: undefined }));
-        const configured = this.#options.model ?? config?.model ?? undefined;
-        if (configured && !models.some(model => model.id === configured)) {
-            models.unshift(toModel({ model: configured, displayName: configured }));
-        }
-        return {
-            models,
-            defaultModel: configured ?? available.find(model => model.isDefault)?.model,
-        };
+        return this.#whileInUse(async () => {
+            const [server, workspace] = await Promise.all([this.#connect(), this.#workspaceRoot()]);
+            const available = await pages<CodexModel>(cursor =>
+                server.request('model/list', { cursor, limit: PAGE_SIZE }),
+            );
+            const models = available.filter(model => !model.hidden).map(toModel);
+            // What a thread gets when it names no model: `--model`, then the user's config.
+            const { config } = await server
+                .request<{ config?: { model?: string | null } }>('config/read', { cwd: workspace })
+                .catch(() => ({ config: undefined }));
+            const configured = this.#options.model ?? config?.model ?? undefined;
+            if (configured && !models.some(model => model.id === configured)) {
+                models.unshift(toModel({ model: configured, displayName: configured }));
+            }
+            return {
+                models,
+                defaultModel: configured ?? available.find(model => model.isDefault)?.model,
+            };
+        });
     }
 
     threadUrl(): string | undefined {
@@ -182,40 +192,44 @@ export class CodexProvider implements Provider {
     }
 
     async createThread(input: CreateThreadInput): Promise<CreatedThread> {
-        const [server, workspace, model] = await Promise.all([
-            this.#connect(),
-            this.#workspaceRoot(),
-            this.#modelFor(input.model),
-        ]);
-        const { thread } = await server.request<{ thread: CodexThread }>('thread/start', {
-            ...this.#threadSettings(workspace),
-            ...(model ? { model } : {}),
+        return this.#whileInUse(async () => {
+            const [server, workspace, model] = await Promise.all([
+                this.#connect(),
+                this.#workspaceRoot(),
+                this.#modelFor(input.model),
+            ]);
+            const { thread } = await server.request<{ thread: CodexThread }>('thread/start', {
+                ...this.#threadSettings(workspace),
+                ...(model ? { model } : {}),
+            });
+            const session = this.#session(thread.id);
+            session.server = server;
+            // Nothing to load yet; the live turn is the whole conversation.
+            session.hydrated = Promise.resolve();
+            await server
+                .request('thread/name/set', { threadId: thread.id, name: input.title })
+                .catch((error: unknown) =>
+                    this.#log(`Couldn't name thread ${thread.id}: ${errorMessage(error)}`),
+                );
+            await this.#startTurn(session, server, input.text, input.attachments);
+            return { providerThreadId: thread.id };
         });
-        const session = this.#session(thread.id);
-        session.server = server;
-        // Nothing to load yet; the live turn is the whole conversation.
-        session.hydrated = Promise.resolve();
-        await server
-            .request('thread/name/set', { threadId: thread.id, name: input.title })
-            .catch((error: unknown) =>
-                this.#log(`Couldn't name thread ${thread.id}: ${errorMessage(error)}`),
-            );
-        await this.#startTurn(session, server, input.text, input.attachments);
-        return { providerThreadId: thread.id };
     }
 
     async sendMessage(input: SendMessageInput): Promise<void> {
-        const session = this.#session(input.providerThreadId);
-        const [server, workspace] = await Promise.all([this.#connect(), this.#workspaceRoot()]);
-        if (session.server !== server) {
-            await server.request('thread/resume', {
-                threadId: session.id,
-                excludeTurns: true,
-                ...this.#threadSettings(workspace),
-            });
-            session.server = server;
-        }
-        await this.#startTurn(session, server, input.text, input.attachments);
+        return this.#whileInUse(async () => {
+            const session = this.#session(input.providerThreadId);
+            const [server, workspace] = await Promise.all([this.#connect(), this.#workspaceRoot()]);
+            if (session.server !== server) {
+                await server.request('thread/resume', {
+                    threadId: session.id,
+                    excludeTurns: true,
+                    ...this.#threadSettings(workspace),
+                });
+                session.server = server;
+            }
+            await this.#startTurn(session, server, input.text, input.attachments);
+        });
     }
 
     async interrupt(providerThreadId: string): Promise<void> {
@@ -274,7 +288,7 @@ export class CodexProvider implements Provider {
 
     /** Load the conversation Codex saved, once. */
     #hydrate(session: Session): Promise<void> {
-        session.hydrated ??= (async () => {
+        session.hydrated ??= this.#whileInUse(async () => {
             const server = await this.#connect();
             try {
                 for (const message of messagesFromHistory(await readHistory(server, session.id))) {
@@ -287,7 +301,7 @@ export class CodexProvider implements Provider {
                 if (!isMissingThread(error)) throw error;
                 session.missing = true;
             }
-        })().catch((error: unknown) => {
+        }).catch((error: unknown) => {
             // Try again on the next watch rather than remember a failed load.
             session.hydrated = undefined;
             throw error;
@@ -346,6 +360,16 @@ export class CodexProvider implements Provider {
     }
 
     /* ------------------------------ the Codex process ----------------------------- */
+
+    async #whileInUse<T>(operation: () => Promise<T>): Promise<T> {
+        this.#operations += 1;
+        try {
+            return await operation();
+        } finally {
+            this.#operations -= 1;
+            if (!this.#disposed) this.#keepOpen();
+        }
+    }
 
     /** The running server, starting one if needed. Each use keeps it open a while longer. */
     #connect(): Promise<AppServer> {
@@ -447,7 +471,7 @@ export class CodexProvider implements Provider {
             const working = [...this.#sessions.values()].some(
                 session => session.tracker.status().status === 'working',
             );
-            if (working) this.#keepOpen();
+            if (working || this.#operations > 0) this.#keepOpen();
             else this.#closeServer();
         }, this.#options.idleCloseMs ?? DEFAULT_IDLE_CLOSE_MS);
         this.#idleTimer.unref?.();

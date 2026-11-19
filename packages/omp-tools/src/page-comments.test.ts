@@ -176,6 +176,9 @@ describe('point_and_comment', () => {
             },
             { triggerTurn: true },
         );
+        await omp.emit('agent_end', { willContinue: false, messages: [] });
+        omp.flush();
+        expect(omp.sendMessage).toHaveBeenCalledTimes(1);
     });
 
     it('streams scoped replies, approval state, steps, and disconnect to a watcher', async () => {

@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { PassThrough } from 'node:stream';
+import { setImmediate } from 'node:timers/promises';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerMacHarness } from './mac-harness.ts';
 import { fakeOmp } from './omp-extension.test-support.ts';
@@ -94,7 +95,7 @@ describe('Mac harness driver protocol', () => {
             settled = true;
         });
         driver.process.stdout.write(JSON.stringify(receipt));
-        await Promise.resolve();
+        await setImmediate();
         expect(settled).toBe(false);
         driver.process.stdout.write('\n');
         expect(await press).toMatchObject({
